@@ -1,0 +1,15 @@
+{
+  "name": "opencode-zcode-auth",
+  "version": "0.1.21",
+  "description": "OpenCode / magpie provider plugin for ZCode (Z.ai + BigModel GLM Coding Plan), with the 1024 Dev Day gift claim and an account-with-no-plan sign-in",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": ["index.mjs", "prompt.mjs", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "magpie", "zcode", "z.ai", "bigmodel", "glm", "coding-plan", "1024"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/player462/opencode-zcode-auth.git"
+  }
+}
