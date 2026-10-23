@@ -12,15 +12,10 @@ Everything else is the upstream plugin's own behaviour.
 
 ## Install
 
-With magpie:
-
-```sh
-magpie plugin add github:player462/opencode-zcode-auth
-```
-
-The package name stays `@magpie-community/opencode-zcode-auth`, so magpie
-treats it as the same `zcode` provider: **remove the upstream one first**,
-or the two claim the same provider id.
+The package name is `opencode-zcode-auth`, so it does not collide with the
+upstream `@magpie-community/opencode-zcode-auth`. Both provide the `zcode`
+provider, so **remove the upstream one first** or magpie has two plugins
+for one provider id.
 
 ```sh
 magpie plugin rm @magpie-community/opencode-zcode-auth
@@ -29,6 +24,30 @@ magpie plugin add github:player462/opencode-zcode-auth
 
 Then turn the account's check-in on: **Settings → Usage → Plugins**. The
 claim runs from there.
+
+### If `magpie plugin add github:...` doesn't stick
+
+Measured on magpie (Windows, 2026-10-23): `magpie plugin add` resolves the
+GitHub package into `plugins/node_modules/`, but the plugin host looks the
+package up by the name in `plugins.json`, so a `github:` spec there fails
+with `no such plugin: ...\node_modules\github:player462\...`.
+
+Install it by name instead, which is what worked:
+
+```sh
+cd ~/.config/magpie/plugins
+bun add opencode-zcode-auth@github:player462/opencode-zcode-auth
+```
+
+Then set the spec magpie loads to the installed name:
+
+```jsonc
+// ~/.config/magpie/plugins.json
+{ "plugins": [ { "spec": "opencode-zcode-auth@latest" }, /* … */ ] }
+```
+
+`magpie plugin list --json` then shows `opencode-zcode-auth@latest` with
+`provides: ["zcode"]`.
 
 ## What was wrong
 
@@ -125,6 +144,10 @@ HOME=$(mktemp -d) bun test .
 - The gift's entitlements carry `effective_at`; until that time the
   balance shows the plan with no buckets and the Start Plan endpoint
   answers `1005 exceed quota limit`. That is expected, not a failure.
+- A `github:` dependency in `plugins/package.json` carries no npm version,
+  so magpie's plugin updater has no newer version to move it to — the
+  fork stays installed instead of being replaced by upstream's `@latest`.
+  That is the point of installing it this way.
 - `prompt.mjs` is unchanged from upstream.
 
 ## License
