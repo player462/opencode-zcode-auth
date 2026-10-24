@@ -3,7 +3,7 @@
 An OpenCode / [magpie](https://usemagpie.ai) provider plugin for **ZCode**
 (Z.ai and BigModel / 智谱 GLM Coding Plan).
 
-This is **upstream `@magpie-community/opencode-zcode-auth` 0.1.24 plus two
+This is **upstream `@magpie-community/opencode-zcode-auth` 0.1.26 plus two
 fixes it does not have**:
 
 1. **The 1024 Dev Day gift is claimed, not just listed.** Upstream finds
@@ -21,17 +21,29 @@ fixes it does not have**:
    not on the account until it is claimed. That deadlocks: claiming needs
    the account added, adding needs a plan.
 
-Everything else — including 0.1.21's system-prompt placement, 0.1.22's
-Start Plan headers, 0.1.23's per-plan bucket names and 0.1.24's
-`ToolSearchTool` — is upstream's own code, unchanged.
+Everything else — 0.1.21's system-prompt placement, 0.1.22's Start Plan
+headers, 0.1.23's per-plan bucket names, 0.1.24's `ToolSearchTool`,
+0.1.25's `NO_PLAN_KEY` and 0.1.26's gift retry plus `-Trial` fallback — is
+upstream's own code, unchanged.
 
 ## What upstream fixed on its own
 
 Upstream **0.1.24 does find the gift**: it bumped `APP_VERSION` from
 `3.14.3` to `3.16.3`, and ZCode gates the gift list on the client version
 (3.16.0 answers an empty list, 3.16.1 is the first that names
-`zcode-v3-start-plan-1024`). So the card names the gift. It still does not
-claim it, and it still cannot add an account that has no plan.
+`zcode-v3-start-plan-1024`). So the card names the gift.
+
+Upstream **0.1.25 and 0.1.26 still do not claim it, and still cannot add an
+account that has no plan.** 0.1.25's `NO_PLAN_KEY` improves the *message* a
+key with no coding plan gets — it now explains that a gift plan needs
+ZCode's sign-in rather than a key — but `signedIn()` still throws for an
+account with no plan, and `auth` still has no `checkin` hook. Measured
+against the same "no plan, unclaimed 1024 gift" account:
+
+| | add the account | claim the gift |
+| --- | --- | --- |
+| upstream 0.1.26 | fails (`Z.ai API keys: Not Found`) | no `checkin` hook |
+| this fork | succeeds | `claimed ZCode 1024 Dev Day` |
 
 ## Install
 
@@ -134,7 +146,7 @@ claim the gift could not be added to claim it.
 A valid ZCode token with a claimable gift now signs in, and the gift's name
 is the plan shown.
 
-## Changes over upstream 0.1.24
+## Changes over upstream 0.1.26
 
 All in `index.mjs`:
 
@@ -149,6 +161,8 @@ All in `index.mjs`:
 - `signedIn()` — keeps a sign-in that holds a claimable gift but no plan.
 - `claimHint()` — comment corrected: it no longer says only the app can
   claim.
+- Upstream 0.1.25/0.1.26 additions (`NO_PLAN_KEY`, `giftSignIn`, the gift
+  retry and the `-Trial` fallback) are kept as they are.
 
 ## Tests
 
@@ -162,8 +176,7 @@ Run with an isolated home, as the upstream suite requires:
 HOME=$(mktemp -d) bun test packages/zcode
 ```
 
-**105 tests pass**: upstream 0.1.24's own 97 (including its
-`toolsearch.test.mjs`) plus these 8. `bun scripts/check.mjs zcode` passes.
+**110 tests pass**: upstream 0.1.26's own 102 plus these 8. `bun scripts/check.mjs zcode` passes.
 
 ## Notes
 

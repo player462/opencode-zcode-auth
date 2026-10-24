@@ -222,8 +222,15 @@ async function plansOf(s) {
   let sure = false
   try {
     if (!(await plan(s))) start = true
-    else gift = await startPlan(s.jwt, s.device).catch(() => null)
-    sure = true
+    else {
+      // a gift read that failed is unknown, not "no gift": asked again in
+      // a minute, so its trial entries come back with the next list (an
+      // expired session is known: the card says to sign in again)
+      let failed = false
+      gift = await startPlan(s.jwt, s.device).catch(() => ((failed = !jwtExpired(s.jwt)), null))
+      sure = !failed
+    }
+    if (start) sure = true
   } catch {
     // the plan list could not be read: a key account takes the dual route
     // (start stays false, the gift is kept, a minute's ttl), so a gift
@@ -445,12 +452,52 @@ async function codingUsage(s) {
   if (level) out.plan = "GLM Coding " + level[0].toUpperCase() + level.slice(1)
   out.windows = limitWindows(d)
   const resets = personalResets(root, s.key)
+  let subs = null
   try {
-    Object.assign(out, termOf(await call("GET", root + "/api/biz/subscription/list", { auth: s.key })))
+    subs = await call("GET", root + "/api/biz/subscription/list", { auth: s.key })
+    Object.assign(out, termOf(subs))
   } catch {}
   const r = await resets
   if (r) out.resets = r
+  // a key whose account has no plan in force, read as such, says so
+  // rather than showing an empty card: what a key can spend is a GLM
+  // Coding Plan alone (a ZCode gift plan is never one, see NO_PLAN_KEY).
+  // A list that couldn't be read, a level, a counted window or a plan
+  // the sign-in saved keeps the card as it was.
+  const valid = (Array.isArray(subs) ? subs : []).some((x) => String(x?.status ?? "").toUpperCase() === "VALID")
+  if (subs !== null && !valid && !level && !s.plan && !out.windows.some((w) => !w.aside)) return { error: NO_PLAN_KEY }
   return out
+}
+
+// NO_PLAN_KEY is a key with no GLM Coding Plan behind it. ZCode's gift
+// plans (its Start Plan, ZCode 1024 Dev Day) are served by zcode.z.ai
+// to ZCode's own session token, which a sign-in with ZCode (the app's,
+// or Z.ai's or BigModel's in the browser) carries and a key never does:
+// with a key, a gift-only account has nothing to spend, and Z.ai answers
+// each request 1113 (rtbeilin on X, 10-24).
+const NO_PLAN_KEY =
+  "this key's account has no GLM Coding Plan; ZCode's gift plans (the Start Plan, ZCode 1024 Dev Day) are spent only with ZCode's sign-in, never with a key — add the account with \"ZCode app's sign-in\" or a ZCode sign-in in the browser"
+
+// noPlanKey is a coding plan's 1113 refusal (no plan, no resource
+// package) to a sign-in with no ZCode session, its message followed by
+// NO_PLAN_KEY; anything else goes on as it came. Read only once the
+// answer has failed.
+function noPlanKey(res, text) {
+  let v
+  try {
+    v = JSON.parse(text)
+  } catch {
+    return null
+  }
+  // Z.ai names the code in error.code ("1113", as magpie's
+  // zhipu_coding_test has it) or error.type (its 401's "1000"), BigModel's
+  // envelope in code
+  if (![v?.error?.code, v?.error?.type, v?.code].some((c) => String(c ?? "") === "1113")) return null
+  const said = first(v?.error?.message, v?.msg, v?.message)
+  const out = v?.error && typeof v.error === "object" ? { ...v, error: { ...v.error, message: (said ? said + " — " : "") + NO_PLAN_KEY } } : { ...v, msg: (said ? said + " — " : "") + NO_PLAN_KEY }
+  const h = new Headers(res.headers)
+  h.set("content-type", "application/json")
+  return new Response(JSON.stringify(out), { status: res.status, statusText: res.statusText, headers: h })
 }
 
 // startNum reads a number the balance gives as a number or a string.
@@ -653,6 +700,21 @@ async function claimGifts(s) {
   }
   if (names.length) return { claimed: names.length, names }
   return { claimed: 0, names: [], captcha, message: last }
+}
+
+// GIFT_SIGN_IN is the card's line for an account whose gift plans can't
+// be read: ZCode's gift plans (the Start Plan, ZCode 1024 Dev Day, ZCode
+// Trust Build) are served by zcode.z.ai to ZCode's own session alone, so
+// a GLM Coding Plan key, or a sign-in whose ZCode session has run out
+// (that token can't be renewed), lists no <model>-Trial entries and
+// spends the coding plan alone. A fixed sentence, so magpie can
+// translate it; why goes in the display. Set aside: it stops nothing.
+const GIFT_SIGN_IN = "ZCode gift plans (-Trial models) need ZCode's sign-in"
+function giftSignIn(s, key) {
+  if (isTeam(s)) return null
+  if (!s.jwt) return { name: GIFT_SIGN_IN, used: 0, aside: true, display: key ? "not read with an API key: add the account with a ZCode sign-in" : "this sign-in has no ZCode session: sign in again" }
+  if (jwtExpired(s.jwt)) return { name: GIFT_SIGN_IN, used: 0, aside: true, display: "ZCode's sign-in has expired: sign in again" }
+  return null
 }
 
 // startUsage is a gift-only account's card: its buckets, or the words
@@ -1835,7 +1897,11 @@ export async function ZCodeAuthPlugin({ client }) {
           if (out[id]) continue
           out[id] = model({ ...about(raw), id }, url)
         }
-        if (fell) out[Symbol.for("magpie.fellBack")] = true
+        // a fallback tells magpie to keep the list it was told last, which
+        // predates the gift read just made: an account whose gift lists
+        // trial entries is told this list, so ZCode's config out of reach
+        // (a remote box that can't get its CDN) never hides them
+        if (fell && !giftNames(gift).length) out[Symbol.for("magpie.fellBack")] = true
         return out
       },
     },
@@ -1934,6 +2000,14 @@ export async function ZCodeAuthPlugin({ client }) {
               if (startRefused(res.status, text)) return kept(startBlocked(res, text))
               res = new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
             }
+            // a key with no plan behind it: what Z.ai said, and why a
+            // ZCode gift plan can't be had with a key (NO_PLAN_KEY)
+            if (!start && !s.jwt && res.status >= 400) {
+              const text = await res.text()
+              const why = noPlanKey(res, text)
+              if (why) return done(kept(why))
+              res = new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
+            }
             // a trial entry's gift answer that can't serve the request is
             // the agent's answer, not the coding plan's: the user picked the
             // gift, so a spent bucket says 429 (its quota error inside a 200
@@ -1998,6 +2072,10 @@ export async function ZCodeAuthPlugin({ client }) {
           if (!card.error) {
             const hint = await claimHint(s)
             if (hint) card.windows = [...(card.windows ?? []), hint]
+            // a key, or a ZCode session that ran out: no gift read, so no
+            // -Trial models, said on the card rather than left out unsaid
+            const need = start ? null : giftSignIn(s, auth?.type === "api")
+            if (need) card.windows = [...(card.windows ?? []), need]
           }
           return card
         } catch (e) {
@@ -2080,4 +2158,7 @@ export async function ZCodeAuthPlugin({ client }) {
 }
 
 // for tests
-export const _internal = { entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, claimablePlans, claimGifts, signedIn, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
+// config sets what zcodeConfig has read, for tests: null is ZCode's config
+// out of reach, undefined forgets it
+const config = (cfg) => (cfgCache = cfg === undefined ? null : { cfg, at: Date.now() })
+export const _internal = { config, entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, claimablePlans, claimGifts, signedIn, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
