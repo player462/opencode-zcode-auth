@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZCode 礼包</title>
+<link rel="stylesheet" href="style.css">
+<script src="_magpie/bridge.js"></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>ZCode 礼包</h1>
+  <p class="sub" id="sub">正在检测…</p>
+</header>
+
+<section class="status" id="status">
+  <span class="dot" id="dot"></span>
+  <span id="statusText">检测中</span>
+</section>
+
+<ul class="plans" id="plans"></ul>
+
+<section class="how" id="how" hidden>
+  <h2>怎么领取</h2>
+  <ol>
+    <li><b>自动</b>：在 magpie 的「设置 → 用量 → 插件」里打开该账号的签到，礼包会由签到自动领取，验证码用无感验证过。</li>
+    <li><b>让 agent 领取</b>：对 agent 说「用 zcode_claim_gifts 领取 ZCode 礼包」，它会调用插件工具，对所有账号领取。</li>
+  </ol>
+</section>
+
+<div class="actions">
+  <button id="refresh">重新检测</button>
+</div>
+
+<pre class="log" id="log" hidden></pre>
+</body>
+</html>

@@ -1,29 +1,46 @@
 {
   "name": "opencode-zcode-auth",
-  "version": "0.1.27",
-  "description": "OpenCode provider plugin: signs in to Z.ai's or BigModel's (智谱) GLM Coding Plan as ZCode does, including team seats and ZCode's Start Plan",
+  "version": "0.1.28",
+  "description": "OpenCode / magpie provider plugin for ZCode (Z.ai + BigModel GLM Coding Plan): claims ZCode's gift plans (1024 Dev Day, GLOBAL BUILD, Start Plan, Trust Build) through the app's own captcha-checked claim, and adds an account that holds a gift but no plan",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
   "files": [
     "index.mjs",
     "prompt.mjs",
+    "page",
     "README.md"
   ],
   "keywords": [
     "opencode",
     "opencode-plugin",
     "magpie",
+    "magpie-tools",
+    "mcp",
     "zcode",
     "z.ai",
     "bigmodel",
     "glm",
     "coding-plan",
-    "1024"
+    "1024",
+    "gift",
+    "claim"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/player462/opencode-zcode-auth.git"
+  },
+  "magpie": {
+    "page": {
+      "title": "ZCode gifts",
+      "titles": {
+        "zh": "ZCode 礼包",
+        "zh-TW": "ZCode 禮包",
+        "ja": "ZCode ギフト",
+        "de": "ZCode-Geschenke"
+      },
+      "file": "page/index.html"
+    }
   }
 }

@@ -155,3 +155,25 @@ test("an account with no plan and a gift to claim can still be added", async () 
     globalThis.fetch = realFetch
   }
 })
+
+// An account with no coding plan is the one a gift is waiting for: the card
+// used to hide the claim line behind its own error, so three of four
+// accounts showed nothing while ZCode held a gift for each.
+test("a card with no plan still names the gift it holds, and stops being an error", async () => {
+  const token = jwt(now + 86400)
+  const calls = []
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    calls.push({ path: url.pathname, method: init.method ?? "GET" })
+    if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok({ server_time: now, plans: [], balances: [] })
+    if (url.pathname === "/api/v1/zcode-plan/billing/preview") return ok(PREVIEW_GIFT)
+    if (url.pathname === "/api/biz/subscription/list") return ok([])
+    return new Response("", { status: 404 })
+  }
+  const h = await hooks()
+  const u = await h.auth.usage(async () => ({ type: "oauth", access: "", refresh: JSON.stringify({ site: "zai", jwt: token, device: DEVICE }), expires: 0 }), { id: "zcode" })
+  // the gift is named, and the card no longer says "no plan" over it
+  expect(u.error).toBeUndefined()
+  expect(u.plan).toBe("ZCode 1024 Dev Day")
+  expect((u.windows ?? []).map((w) => w.name)).toContain("Gift plans to claim in the ZCode app")
+})

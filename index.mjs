@@ -57,7 +57,26 @@ const siteOf = (s) => (s === "bigmodel" ? "bigmodel" : "zai")
 
 const platform = () => `${process.platform}-${process.arch}` // darwin-arm64, win32-x64, linux-x64, as ZCode names them
 const uuid = () => crypto.randomUUID()
-const anyDevice = uuid() // X-Device-Mid for calls made signed out (the model list)
+// ownDevice is the machine id ZCode itself keeps: the app writes it to
+// telemetry-state.json (3.16) or onboarding-record.json, and sends it as
+// X-Device-Mid on every call. Reading it, rather than minting one per
+// process, is what makes this plugin's calls carry the same device as the
+// app's — a fresh id on every start is a device ZCode has never seen.
+// Resolved lazily: zcodeDir reads setting.json, and this runs at module
+// load, before the helpers below are initialised.
+let deviceCache = ""
+function ownDevice() {
+  if (deviceCache) return deviceCache
+  for (const name of ["telemetry-state.json", "onboarding-record.json"]) {
+    try {
+      const d = readJSON(join(zcodeDir(), name))?.deviceMid
+      const t = typeof d === "string" ? d.trim() : ""
+      if (t) return (deviceCache = t)
+    } catch {}
+  }
+  return ""
+}
+const anyDevice = ownDevice() || uuid() // X-Device-Mid for calls made signed out (the model list)
 const first = (...ss) => ss.map((s) => (typeof s === "string" ? s.trim() : "")).find((s) => s) ?? ""
 
 // STATUS_TEXT is Go's http.StatusText, which magpie's built-in said a
@@ -645,13 +664,27 @@ async function claimablePlans(s) {
     .map((p) => ({ planId: p.plan_id.trim(), name: first(typeof p?.name === "string" ? p.name : "", p.plan_id.trim()) }))
 }
 
+// CAPTCHA_CONFIG is ZCode's Aliyun captcha scene, as
+// GET /api/v1/client/configs gives it ({enabled, prefix, region, sceneId}).
+// The claim is guarded with it: a claim without an attestation is answered
+// 3007 "captcha verify failed". The scene is read from the server rather
+// than hard-coded, so a rotation of it needs no release.
+async function captchaConfig() {
+  const d = await call("GET", `${ZCODE}/api/v1/client/configs?app_version=${GIFT_VERSION}&platform=${platform()}`, { headers: { "User-Agent": GIFT_UA } })
+  const c = d?.configs?.captcha
+  if (!c || typeof c !== "object") return null
+  const sceneId = typeof c.sceneId === "string" ? c.sceneId.trim() : ""
+  if (c.enabled !== true || !sceneId) return null
+  return { enabled: true, sceneId, prefix: first(typeof c.prefix === "string" ? c.prefix : "", "no8xfe"), region: first(typeof c.region === "string" ? c.region : "", "cn") }
+}
+
 // claimCall POSTs the claim as the ZCode app does and gives the envelope
 // back unread: the codes are what says how it went, and call() would turn
 // them into thrown messages. The app's own codes: 0 with a plan claimed
 // it, 1003 "target already exists" is already claimed, 3007 is the
-// Aliyun captcha the app's renderer makes (a claim ZCode guards that way
-// is refused with it), 1001 the plan is gone.
-async function claimCall(s, planId) {
+// Aliyun captcha (the claim needs the attestation the app's renderer
+// makes), 1001 the plan is gone.
+async function claimCall(s, planId, attestation) {
   const h = {
     "Content-Type": "application/json",
     Accept: "application/json",
@@ -660,6 +693,10 @@ async function claimCall(s, planId) {
     "X-Device-Mid": s.device || anyDevice,
     "X-ZCode-App-Version": GIFT_VERSION,
     "X-Platform": platform(),
+  }
+  if (attestation?.param) {
+    h["X-Aliyun-Captcha-Verify-Param"] = attestation.param
+    if (attestation.region) h["X-Aliyun-Captcha-Verify-Region"] = attestation.region
   }
   const res = await fetch(`${ZCODE}/api/v1/zcode-plan/billing/claim`, { method: "POST", headers: h, body: JSON.stringify({ plan_id: planId }) })
   const text = await res.text()
@@ -671,21 +708,47 @@ async function claimCall(s, planId) {
   return { status: res.status, code, msg: first(typeof env?.data?.message === "string" ? env.data.message : "", typeof env?.msg === "string" ? env.msg : ""), plan: env?.data?.plan ?? null }
 }
 
+// attestation is the Aliyun captcha answer the page got for this account:
+// the renderer runs the scene's traceless verification and hands the
+// captchaVerifyParam back here. magpie's page sandbox has no network of
+// its own, so the page asks the window for it and the window asks this.
+// null when there is none (or it is stale).
+const ATTEST_TTL = 120_000
+const attestations = new Map()
+const attestKey = (s) => String(s.jwt ?? "")
+function putAttestation(s, a) {
+  const param = typeof a?.param === "string" ? a.param.trim() : ""
+  if (!param) return false
+  attestations.set(attestKey(s), { param, region: first(typeof a?.region === "string" ? a.region : "", ""), at: Date.now() })
+  return true
+}
+function getAttestation(s) {
+  const a = attestations.get(attestKey(s))
+  if (!a) return null
+  if (Date.now() - a.at > ATTEST_TTL) {
+    attestations.delete(attestKey(s))
+    return null
+  }
+  return a
+}
+
 // claimGifts claims every gift plan ZCode holds for the account. It answers
 // what came of it: {claimed, names} for the ones it put on the account,
-// {captcha: true} when ZCode asked for the app's attestation (the claim is
-// never solved here), and nothing claimed with no captcha is "nothing to
-// claim". A refusal on one plan does not stop the next.
-async function claimGifts(s) {
+// {captcha: true} when ZCode guards the claim with its captcha and no
+// attestation is had (the page solves it, see attestation), and nothing
+// claimed with no captcha is "nothing to claim". A refusal on one plan
+// does not stop the next.
+async function claimGifts(s, opts = {}) {
   const plans = await claimablePlans(s)
   if (!plans.length) return { claimed: 0, names: [] }
   const names = []
   let captcha = false
   let last = ""
+  let used = opts.attestation ?? getAttestation(s)
   for (const p of plans) {
     let r
     try {
-      r = await claimCall(s, p.planId)
+      r = await claimCall(s, p.planId, used)
     } catch (e) {
       last = e?.message ?? String(e)
       continue
@@ -695,8 +758,17 @@ async function claimGifts(s) {
       names.push(p.name)
       continue
     }
-    if (r.code === "3007" || /captcha|security verification|安全验证/i.test(r.msg)) captcha = true
-    else if (r.code !== "1003") last = r.msg || `code ${r.code}`
+    if (r.code === "3007" || /captcha|security verification|安全验证/i.test(r.msg)) {
+      // the attestation was missing or no longer good: drop it, so the
+      // next attempt gets a fresh one from the page
+      if (used) {
+        attestations.delete(attestKey(s))
+        used = null
+        captcha = true
+      } else captcha = true
+      continue
+    }
+    if (r.code !== "1003") last = r.msg || `code ${r.code}`
   }
   if (names.length) return { claimed: names.length, names }
   return { claimed: 0, names: [], captcha, message: last }
@@ -1840,6 +1912,43 @@ function dress(text, site, device, place) {
 
 // ---- the plugin ------------------------------------------------------------------
 
+// ZCODE_ACCOUNTS is how the tools find the signed-in accounts: magpie keeps
+// them in its own store, and a tool gets no getAuth of its own (it runs for
+// an agent, not inside the provider's request). The first account that
+// holds a gift is the one a claim spends, so one tool call does the whole
+// job across every account.
+//
+// magpie's config home is ~/.config/magpie, or %APPDATA%\magpie on Windows
+// when it is not there; MAGPIE_HOME overrides both, as magpie's own
+// appdir does.
+function magpieHome() {
+  const env = first(process.env.MAGPIE_HOME, "")
+  if (env) return env
+  const unix = join(homedir(), ".config", "magpie")
+  if (existsSync(unix)) return unix
+  const win = first(process.env.APPDATA, process.env.LOCALAPPDATA, "")
+  return win ? join(win, "magpie") : unix
+}
+
+function zcodeAccounts() {
+  const store = readJSON(join(magpieHome(), "plugin-auth.json"))
+  if (!store || typeof store !== "object") return []
+  const out = []
+  const seen = new Set()
+  const walk = (o) => {
+    if (!o || typeof o !== "object") return
+    for (const [k, v] of Object.entries(o)) {
+      if (/^zcode(#|$)/.test(k) && v && typeof v === "object" && typeof v.refresh === "string") {
+        if (seen.has(k)) continue
+        seen.add(k)
+        out.push({ id: String(v.accountId ?? k), key: k, auth: { type: v.type ?? "oauth", access: v.access, refresh: v.refresh, expires: v.expires, accountId: v.accountId } })
+      } else walk(v)
+    }
+  }
+  walk(store)
+  return out
+}
+
 export async function ZCodeAuthPlugin({ client }) {
   const log = (message) => {
     try {
@@ -1852,6 +1961,88 @@ export async function ZCodeAuthPlugin({ client }) {
     authorize: () => authorize(site, log),
   })
   return {
+    // ZCode's gifts, as tools magpie offers every agent: what ZCode is
+    // holding, and claiming it. The claim solves the Aliyun captcha the
+    // same way the app does (the scene's traceless check), so a gift is
+    // claimed without opening anything.
+    tool: {
+      zcode_gifts: {
+        description:
+          "Lists the ZCode gift plans (ZCode 1024 Dev Day, ZCODE GLOBAL BUILD, Start Plan, Trust Build) that ZCode is holding for every signed-in ZCode account and has not put on it yet. " +
+          "Use it to check whether there is anything to claim before zcode_claim_gifts.",
+        args: { type: "object", properties: {}, additionalProperties: false },
+        async execute() {
+          const out = []
+          for (const a of zcodeAccounts()) {
+            const s = stateOf(a.auth)
+            if (!s?.jwt) {
+              out.push({ account: a.id, plans: [], note: "no ZCode sign-in on this account" })
+              continue
+            }
+            if (jwtExpired(s.jwt)) {
+              out.push({ account: a.id, plans: [], note: "ZCode's sign-in has expired" })
+              continue
+            }
+            let plans = []
+            let note
+            try {
+              plans = await claimablePlans(s)
+            } catch (e) {
+              note = e?.message ?? String(e)
+            }
+            out.push({ account: a.id, plans, ...(note ? { note } : {}) })
+          }
+          const n = out.reduce((k, x) => k + x.plans.length, 0)
+          return { claimable: n, accounts: out }
+        },
+      },
+      zcode_claim_gifts: {
+        description:
+          "Claims every ZCode gift plan ZCode is holding for every signed-in account, solving the Aliyun captcha the claim is guarded with through the scene's traceless verification. " +
+          "Answers which account got which plan; nothing to claim is not an error.",
+        args: {
+          type: "object",
+          properties: {
+            account: { type: "string", description: "only this account (its id or email); every account when left out" },
+          },
+          additionalProperties: false,
+        },
+        async execute(args) {
+          const want = typeof args?.account === "string" ? args.account.trim().toLowerCase() : ""
+          const results = []
+          for (const a of zcodeAccounts()) {
+            if (want && !a.id.toLowerCase().includes(want)) continue
+            const s = stateOf(a.auth)
+            if (!s?.jwt) {
+              results.push({ account: a.id, outcome: "skipped", note: "no ZCode sign-in on this account" })
+              continue
+            }
+            if (jwtExpired(s.jwt)) {
+              results.push({ account: a.id, outcome: "skipped", note: "ZCode's sign-in has expired" })
+              continue
+            }
+            let r
+            try {
+              r = await claimGifts(s)
+            } catch (e) {
+              results.push({ account: a.id, outcome: "failed", error: e?.message ?? String(e) })
+              continue
+            }
+            if (r.claimed) {
+              routes.clear()
+              results.push({ account: a.id, outcome: "claimed", plans: r.names })
+            } else if (r.captcha) {
+              // the attestation is what the app's renderer makes: the page
+              // solves it (see claimScene), a tool call cannot
+              results.push({ account: a.id, outcome: "captcha", note: "ZCode guards this claim with its captcha; solve it on the ZCode page in magpie" })
+            } else {
+              results.push({ account: a.id, outcome: "none", ...(r.message ? { note: r.message } : {}) })
+            }
+          }
+          return { claimed: results.filter((x) => x.outcome === "claimed").length, accounts: results }
+        },
+      },
+    },
     config: async (cfg) => {
       cfg.provider ??= {}
       const was = cfg.provider[PROVIDER] ?? {}
@@ -2067,16 +2258,25 @@ export async function ZCodeAuthPlugin({ client }) {
           const { start, gift } = await plansOf(s)
           const card = saved(start ? await startUsage(s) : gift ? await dualUsage(s) : await codingUsage(s))
           // a gift plan ZCode holds for the account but has not put on it:
-          // named on the card, claimed by checkin (see claimGifts). A card
-          // that is an error keeps its error and asks nothing
-          if (!card.error) {
-            const hint = await claimHint(s)
-            if (hint) card.windows = [...(card.windows ?? []), hint]
-            // a key, or a ZCode session that ran out: no gift read, so no
-            // -Trial models, said on the card rather than left out unsaid
-            const need = start ? null : giftSignIn(s, auth?.type === "api")
-            if (need) card.windows = [...(card.windows ?? []), need]
+          // named on the card, claimed by checkin (see claimGifts). The
+          // line goes on a card that has an error too: an account with no
+          // coding plan is exactly the one a gift is waiting for, and the
+          // error said "no plan" while the gift sat unclaimed. The error
+          // stays in error, and the line is set aside so it stops nothing.
+          const hint = await claimHint(s)
+          if (hint) {
+            card.windows = [...(card.windows ?? []), hint]
+            // the account is not "no plan" after all: it holds one to
+            // claim, so the card names it instead of only refusing
+            if (card.error) {
+              delete card.error
+              card.plan = first(hint.display.replace(/^\d+\s*·\s*/, ""), card.plan, "ZCode gift plan")
+            }
           }
+          // a key, or a ZCode session that ran out: no gift read, so no
+          // -Trial models, said on the card rather than left out unsaid
+          const need = start ? null : giftSignIn(s, auth?.type === "api")
+          if (need) card.windows = [...(card.windows ?? []), need]
           return card
         } catch (e) {
           return saved({ error: e?.message ?? String(e) })
@@ -2106,13 +2306,53 @@ export async function ZCodeAuthPlugin({ client }) {
         } catch (e) {
           return { outcome: "failed", message: e?.message ?? String(e) }
         }
-        if (r.captcha) return { outcome: "captcha", message: "ZCode asked for its app's verification to claim the gift; claim it in the ZCode app" }
         if (r.claimed) {
           // the gift is on the account now: the card and the routes read
           // again rather than waiting out their cache
           routes.clear()
           return { outcome: "claimed", message: `claimed ${r.names.join(", ")}` }
         }
+        // ZCode guarded the claim with its Aliyun captcha and no
+        // attestation is had yet. The scene is handed out (claimScene) for
+        // the page to solve with the traceless check, which needs no
+        // interaction; until it does, say so rather than claim silently
+        // that there is nothing.
+        if (r.captcha) return { outcome: "captcha", message: "ZCode's captcha guards this gift; open the ZCode page in magpie to solve it, or claim it in the ZCode app" }
+        return { outcome: "inactive", ...(r.message ? { message: r.message } : {}) }
+      },
+      // claimScene is the captcha scene a page solves the claim with, and
+      // submitClaimAttestation takes what it got. magpie's page sandbox has
+      // no network of its own, so the page asks the window, the window
+      // asks here: the scene comes from ZCode's own client configs, and the
+      // captchaVerifyParam the page's traceless check produced is kept
+      // against this account until the claim spends it.
+      async claimScene(getAuth) {
+        const auth = await getAuth()
+        const s = stateOf(auth)
+        if (!s?.jwt) return { error: "not signed in to ZCode" }
+        try {
+          const c = await captchaConfig()
+          return c ? { ...c } : { error: "ZCode's captcha is off" }
+        } catch (e) {
+          return { error: e?.message ?? String(e) }
+        }
+      },
+      async submitClaimAttestation(getAuth, attestation) {
+        const auth = await getAuth()
+        const s = stateOf(auth)
+        if (!s?.jwt) return { error: "not signed in to ZCode" }
+        if (!putAttestation(s, attestation)) return { error: "no captchaVerifyParam" }
+        let r
+        try {
+          r = await claimGifts(s, { attestation: getAttestation(s) })
+        } catch (e) {
+          return { error: e?.message ?? String(e) }
+        }
+        if (r.claimed) {
+          routes.clear()
+          return { outcome: "claimed", names: r.names }
+        }
+        if (r.captcha) return { outcome: "captcha", error: "the attestation was refused; solve it again" }
         return { outcome: "inactive", ...(r.message ? { message: r.message } : {}) }
       },
       methods: [
@@ -2161,4 +2401,4 @@ export async function ZCodeAuthPlugin({ client }) {
 // config sets what zcodeConfig has read, for tests: null is ZCode's config
 // out of reach, undefined forgets it
 const config = (cfg) => (cfgCache = cfg === undefined ? null : { cfg, at: Date.now() })
-export const _internal = { config, entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, claimablePlans, claimGifts, signedIn, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
+export const _internal = { config, entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, claimablePlans, claimGifts, captchaConfig, putAttestation, getAttestation, signedIn, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }

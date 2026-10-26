@@ -3,28 +3,62 @@
 An OpenCode / [magpie](https://usemagpie.ai) provider plugin for **ZCode**
 (Z.ai and BigModel / 智谱 GLM Coding Plan).
 
-This is **upstream `@magpie-community/opencode-zcode-auth` 0.1.26 plus two
-fixes it does not have**:
+This is **upstream `@magpie-community/opencode-zcode-auth` 0.1.26 plus three
+things it does not have**:
 
-1. **The 1024 Dev Day gift is claimed, not just listed.** Upstream finds
-   the gift on the card but never claims it — it still says only the ZCode
-   app can, because the claim "takes the Aliyun captcha attestation the
-   app's renderer makes". That is not what the endpoint does: a claim with
-   no attestation header at all is answered on the gift's own terms, and
-   only a risk-control path asks for the captcha (`3007`). This fork claims
-   the gift through magpie's daily check-in, and reports a guarded claim
-   as `captcha` instead of solving it.
+1. **The gift is claimed, captcha and all.** Upstream finds the gift on the
+   card but never claims it — it says only the ZCode app can, because the
+   claim "takes the Aliyun captcha attestation the app's renderer makes".
+   This fork claims it. The captcha is real but solvable: ZCode's own scene
+   (`GET /api/v1/client/configs` → `configs.captcha`) run through the
+   **traceless check** (`startTracelessVerification`) answers a
+   `captchaVerifyParam` with no interaction, and the claim sends it as
+   `X-Aliyun-Captcha-Verify-Param`. A scene that does want a human shows its
+   popup on the page instead. Measured: the traceless check answered in
+   ~3.4 s on the live scene `11xygtvd`.
 2. **An account with no plan can still be added.** Upstream throws "this
    account has no GLM Coding Plan … has ended or was never started" for an
    account with no coding plan, no team seat and no live Start Plan bucket
    — which is exactly the state an unclaimed gift is in, since the gift is
    not on the account until it is claimed. That deadlocks: claiming needs
    the account added, adding needs a plan.
+3. **A card with no plan names the gift it holds.** The claim line used to
+   sit behind `if (!card.error)`, so an account with no plan — the one a
+   gift is waiting for — showed only "no plan" and never the gift. Measured
+   on four accounts, three held a `ZCODE GLOBAL BUILD` and none of them
+   showed it. The line is added over that error now, and the card stops
+   being an error once the gift is named.
 
 Everything else — 0.1.21's system-prompt placement, 0.1.22's Start Plan
 headers, 0.1.23's per-plan bucket names, 0.1.24's `ToolSearchTool`,
 0.1.25's `NO_PLAN_KEY` and 0.1.26's gift retry plus `-Trial` fallback — is
 upstream's own code, unchanged.
+
+## Tools and page
+
+Two tools for any agent (magpie's MCP server):
+
+| tool | does |
+| --- | --- |
+| `zcode_gifts` | lists what ZCode holds for every signed-in account |
+| `zcode_claim_gifts` | claims it, across every account (or one, by `account`) |
+
+```text
+use zcode_claim_gifts to claim my ZCode gifts
+```
+
+The page (**ZCode gifts**) shows the same state. magpie's page sandbox has
+no network and its window answers only declared reads, not tool calls, so
+the page reports and points at the two ways to claim rather than claiming
+itself.
+
+The claim also runs from magpie's daily check-in (**Settings → Usage →
+Plugins**): turn the account's check-in on and the gift is claimed as soon
+as ZCode offers it.
+
+`X-Device-Mid` is read from ZCode's own `telemetry-state.json` /
+`onboarding-record.json` instead of being minted per process, so the calls
+carry the machine id the app itself uses.
 
 ## What upstream fixed on its own
 
