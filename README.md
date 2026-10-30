@@ -39,15 +39,28 @@ bucket naming, 0.1.37's "no gift is not a failed check-in", 0.1.38's
 
 ## Gift plans it handles
 
-Whatever ZCode is holding, by `plan_id` — nothing is matched by name:
+Whatever ZCode is holding, by `plan_id` — nothing is matched by name, and
+from two lists:
 
-| plan | grants |
-| --- | --- |
-| `zcode-v3-start-plan-1030-wk` · **ZCODE WEEKEND BUILD** | GLM-5.3-Flash 500M tokens |
-| `zcode-v3-start-plan-nt-1026` · ZCODE GLOBAL BUILD | GLM-5.3-Flash 300M |
-| `zcode-v3-start-plan-1024` · ZCode 1024 Dev Day | GLM-5.3-Flash 300M + GLM-5.3 200M |
-| `zcode-v3-start-plan-trust-*` · ZCode Trust Build | per campaign |
-| `zcode-v3-start-plan` · Start Plan | daily |
+| plan | grants | listed on |
+| --- | --- | --- |
+| `zcode-v3-start-plan-1030-wk` · **ZCODE WEEKEND BUILD** | GLM-5.3-Flash 500M tokens | **campaign banner** |
+| `zcode-v3-start-plan-nt-1026` · ZCODE GLOBAL BUILD | GLM-5.3-Flash 300M | `/billing/preview` |
+| `zcode-v3-start-plan-1024` · ZCode 1024 Dev Day | GLM-5.3-Flash 300M + GLM-5.3 200M | `/billing/preview` |
+| `zcode-v3-start-plan-trust-*` · ZCode Trust Build | per campaign | `/billing/preview` |
+| `zcode-v3-start-plan` · Start Plan | daily | `/billing/preview` |
+
+**The campaign banner is the one that matters.** A campaign gift never
+appears in `/billing/preview` — that lists the manual-claim gifts alone —
+so a Weekend Build waiting on an account reads as "nothing to claim" and
+nothing ever claims it. ZCode advertises it on
+`GET /api/v1/marketing/touch`, whose deliveries carry a banner with a
+`claim_zcode_plan` button (`action.args.plan_id`) and the plan's own name
+beside it; the client posts that id to the same `/billing/claim`. The
+plugin reads that list beside the preview, so the check-in, the card and
+the tools all see campaign gifts. Measured end to end on three accounts
+that had a Weekend Build waiting on the banner and nothing in preview:
+claimed, and the banner went away.
 
 An entitlement's `effective_at` can be later than the plan's `starts_at`
 (the Weekend Build starts 22:25 and its tokens at 23:00 Beijing): until
@@ -123,10 +136,10 @@ Then set the spec magpie loads to the installed name:
 HOME=$(mktemp -d) bun test packages/zcode
 ```
 
-**178 tests pass**: upstream 0.1.38's own 173 (with its "the card's error
-stays the error" test rewritten to the behaviour this fork has), plus 5 for
-the captcha attestation and the tools. `bun scripts/check.mjs zcode`
-passes.
+**180 tests pass**: upstream 0.1.38's own 173 (with its "the card's error
+stays the error" test rewritten to the behaviour this fork has), plus 7 for
+the campaign banner, the captcha attestation and the tools.
+`bun scripts/check.mjs zcode` passes.
 
 ## License
 

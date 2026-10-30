@@ -96,3 +96,58 @@ test("the tools list and claim every account's gift", async () => {
   expect(c.claimed).toBe(0)
   expect(Array.isArray(c.accounts)).toBe(true)
 })
+
+// The Weekend Build never appears in /billing/preview: ZCode advertises it
+// through a marketing banner whose claim button carries the plan_id, and
+// the same /billing/claim puts it on the account. A preview with nothing
+// in it beside a campaign waiting is a claimable gift, and the card names
+// it.
+test("a campaign banner's claim_zcode_plan is a gift the check-in claims", async () => {
+  claimReply = () => new Response(JSON.stringify({ code: 0, msg: "", data: { server_time: now, plan: { plan_id: "zcode-v3-start-plan-1030-wk", name: "ZCODE WEEKEND BUILD", status: "active" } } }), { headers: { "content-type": "application/json" } })
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    const headers = Object.fromEntries(new Headers(init.headers ?? {}))
+    calls.push({ path: url.pathname, method: init.method ?? "GET", headers, body: init.body })
+    if (url.pathname.endsWith("/preview")) return ok({ server_time: now, plans: [] })
+    if (url.pathname === "/api/v1/marketing/touch") {
+      return ok({
+        deliveries: [{
+          campaign_id: "2101141259813175296", resource_position: "banner",
+          banner: {
+            buttons: [
+              { action: { type: "close", args: null } },
+              { action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-1030-wk" } } },
+            ],
+            background: { args: { zcode_plan: { plan_id: "zcode-v3-start-plan-1030-wk", name: "ZCODE WEEKEND BUILD" } } },
+          },
+        }],
+      })
+    }
+    if (url.pathname.endsWith("/claim")) return claimReply(calls.filter((c) => c.path.endsWith("/claim")).length)
+    if (url.pathname.endsWith("/balance")) return ok({ server_time: now, plans: [], balances: [] })
+    if (url.pathname === "/api/biz/subscription/list") return ok([])
+    return new Response("", { status: 404 })
+  }
+
+  const h = await hooks()
+  const r = await h.auth.checkin(async () => oauth(), { id: "zcode" })
+  expect(r.outcome).toBe("claimed")
+  expect(r.message).toContain("ZCODE WEEKEND BUILD")
+  const c = calls.find((x) => x.path.endsWith("/claim"))
+  expect(JSON.parse(c.body)).toEqual({ plan_id: "zcode-v3-start-plan-1030-wk" })
+
+  // the card names it while it waits, and a claimed one leaves no line
+  const u = await h.auth.usage(async () => oauth(), { id: "zcode" })
+  expect(u.windows?.some((w) => w.name === "Gift plans to claim in the ZCode app")).toBe(true)
+})
+
+test("a campaign read that fails is no gift, and never a failed claim", async () => {
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname.endsWith("/preview")) return ok({ server_time: now, plans: [] })
+    return new Response("", { status: 404 }) // marketing/touch unreachable
+  }
+  const h = await hooks()
+  const r = await h.auth.checkin(async () => oauth(), { id: "zcode" })
+  expect(r).toEqual({ outcome: "inactive", message: "no ZCode gift plan to claim" })
+})

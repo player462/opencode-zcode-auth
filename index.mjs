@@ -676,17 +676,66 @@ const CLAIM_HINT = "Gift plans to claim in the ZCode app"
 // own.
 async function claimHint(s) {
   if (!s.jwt || jwtExpired(s.jwt)) return null
-  let d
+  // soft both ways: a read that fails is no line at all, never a card or a
+  // refusal of its own (the claim itself decides what a failed read means)
+  let plans
   try {
-    d = await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${platform()}`, { auth: "Bearer " + s.jwt, device: s.device })
+    plans = [...(await previewGifts(s)), ...(await campaignGifts(s))]
   } catch {
     return null
   }
-  const plans = (previewPlans(d) ?? []).filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim())
   if (!plans.length) return null
   const n = plans.length
-  const plan = first(...plans.map((p) => (typeof p?.name === "string" ? p.name : "")), "ZCode gift plan")
+  const plan = first(...plans.map((p) => p.name), "ZCode gift plan")
   return { name: CLAIM_HINT, used: 0, aside: true, display: `${n} · ${plan}` }
+}
+
+// previewGifts is /billing/preview's list as {planId, name}: the gift plans
+// ZCode holds for the account that the ZCode app's settings dialog claims
+// by hand. null when the list doesn't read (a plan list that isn't a list,
+// data that isn't an object) — a caller claiming from it must not claim
+// blind; [] when the account has nothing. A read that fails throws, and
+// the caller says what a failed read means for it.
+async function previewGifts(s) {
+  const d = await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${platform()}`, { auth: "Bearer " + s.jwt, device: s.device, headers: zcodeHeaders() })
+  const listed = previewPlans(d)
+  if (!listed) return null
+  return listed
+    .filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim())
+    .map((p) => ({ planId: p.plan_id.trim(), name: first(typeof p?.name === "string" ? p.name : "", p.plan_id.trim()) }))
+}
+
+// campaignGifts is the gift plans ZCode is advertising to this account
+// through a marketing banner. A campaign's plan never appears in
+// /billing/preview — that lists the manual-claim gifts alone — so without
+// this read the Weekend Build looks unclaimable and nothing ever claims it.
+// The client draws the banner's button from action.args.plan_id and posts
+// that id to the same /billing/claim, which is what this does.
+// GET /api/v1/marketing/touch answers {deliveries: [{banner: {buttons:
+// [{action: {type: "claim_zcode_plan", args: {plan_id}}}]}}]}, and the
+// banner's own copy of the plan names it. Soft: a read that fails adds no
+// campaign plan, and never turns a claim into a failure — the preview is
+// what decides that.
+async function campaignGifts(s) {
+  let d
+  try {
+    d = await call("GET", `${ZCODE}/api/v1/marketing/touch?seq=0`, { auth: "Bearer " + s.jwt, device: s.device, headers: zcodeHeaders() })
+  } catch {
+    return []
+  }  const out = []
+  const seen = new Set()
+  for (const del of Array.isArray(d?.deliveries) ? d.deliveries : []) {
+    const named = del?.banner?.background?.args?.zcode_plan
+    for (const b of del?.banner?.buttons ?? []) {
+      const act = b?.action
+      const id = typeof act?.args?.plan_id === "string" ? act.args.plan_id.trim() : ""
+      if (act?.type !== "claim_zcode_plan" || !id || seen.has(id)) continue
+      seen.add(id)
+      const name = first(typeof named?.name === "string" && named.plan_id === id ? named.name : "", id)
+      out.push({ planId: id, name })
+    }
+  }
+  return out
 }
 
 // ---- the daily claim ---------------------------------------------------------------
@@ -808,30 +857,33 @@ function previewPlans(d) {
 async function claimDaily(s) {
   if (!s?.jwt) return { outcome: "ineligible", message: "ZCode's gift plans are claimed with a ZCode sign-in; this account has none" }
   if (jwtExpired(s.jwt)) return { outcome: "failed", message: EXPIRED }
-  let d
+  // both lists: the manual-claim gifts /billing/preview names, and the
+  // campaign gifts a marketing banner is advertising (the Weekend Build
+  // never appears in preview). The preview is what says whether the claim
+  // can be made at all: a read that fails is failed (unknown), never a
+  // claim blind, and the campaign read is soft beside it.
+  let plans
   try {
-    d = await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${platform()}`, { auth: "Bearer " + s.jwt, device: s.device, headers: zcodeHeaders() })
+    const listed = await previewGifts(s)
+    if (!listed) return { outcome: "failed", message: "gift plans to claim: the plan list doesn't read" }
+    plans = [...listed, ...(await campaignGifts(s))]
   } catch (e) {
     return { outcome: "failed", message: `gift plans to claim: ${e?.message ?? String(e)}` }
   }
-  const listed = previewPlans(d)
-  if (!listed) return { outcome: "failed", message: "gift plans to claim: the plan list doesn't read" }
-  const plans = listed.filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim())
   if (!plans.length) return { outcome: "inactive", message: "no ZCode gift plan to claim" }
   const got = []
   // the attestation a page solved this account's captcha into, when it is
   // had: a guarded claim is refused with 3007 without one
   let att = getAttestation(s)
   for (const p of plans) {
-    const name = first(typeof p.name === "string" ? p.name : "", p.plan_id)
-    const r = await claimOne(s, p.plan_id.trim(), att)
+    const r = await claimOne(s, p.planId, att)
     // the attestation was missing or no longer good: drop it, so the page
     // is asked for a fresh one rather than the same stale param twice
     if (r.outcome === "captcha" && att) {
       attestations.delete(attestKey(s))
       att = null
     }
-    got.push({ name, ...r })
+    got.push({ name: p.name, ...r })
   }
   const named = (o) => got.filter((g) => g.outcome === o).map((g) => g.name)
   const claimed = named("claimed")
@@ -1230,11 +1282,11 @@ async function signedIn(site, token, jwt, device, onTeam = false) {
     if (!berr && !jwtExpired(jwt)) {
       let claimable = []
       try {
-        const d = await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${platform()}`, { auth: "Bearer " + jwt, device, headers: zcodeHeaders() })
-        claimable = (previewPlans(d) ?? []).filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim())
+        const s = { jwt, device }
+        claimable = [...(await previewGifts(s)), ...(await campaignGifts(s))]
       } catch {}
       if (claimable.length) {
-        const names = [...new Set(claimable.map((p) => first(typeof p.name === "string" ? p.name : "", p.plan_id)))]
+        const names = [...new Set(claimable.map((p) => p.name))]
         return { base: SITES[site].base, jwt, plan: first(names[0], "ZCode gift plan"), giftPending: claimable.length }
       }
     }
@@ -2310,8 +2362,7 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
             let plans = []
             let note
             try {
-              const d = await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${platform()}`, { auth: "Bearer " + s.jwt, device: s.device, headers: zcodeHeaders() })
-              plans = (previewPlans(d) ?? []).filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim()).map((p) => ({ planId: p.plan_id.trim(), name: first(typeof p.name === "string" ? p.name : "", p.plan_id) }))
+              plans = [...(await previewGifts(s)), ...(await campaignGifts(s))]
             } catch (e) {
               note = e?.message ?? String(e)
             }
@@ -2822,4 +2873,4 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
 // config sets what zcodeConfig has read, for tests: null is ZCode's config
 // out of reach, undefined forgets it
 const config = (cfg) => (cfgCache = cfg === undefined ? null : { cfg, at: Date.now() })
-export const _internal = { config, entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, claimDaily, captchaConfig, putAttestation, getAttestation, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY }
+export const _internal = { config, entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, previewGifts, campaignGifts, claimDaily, captchaConfig, putAttestation, getAttestation, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY }
