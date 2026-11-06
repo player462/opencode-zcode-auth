@@ -23,13 +23,19 @@ import { isAbsolute, join } from "node:path"
 import PROMPT from "./prompt.mjs"
 
 const PROVIDER = "zcode"
+// FREE_FIRST is magpie's switch for free first in the provider's editor
+const FREE_FIRST = "free_first"
 const ZCODE = "https://zcode.z.ai"
 const ZAI_API = "https://api.z.ai"
 const BIGMODEL_API = "https://bigmodel.cn" // BigModel's business API, where ZCode asks it
 const ZAI_BASE = "https://api.z.ai/api/anthropic"
 const BIGMODEL_BASE = "https://open.bigmodel.cn/api/anthropic"
 const START_BASE = ZCODE + "/api/v1/zcode-plan/anthropic"
-const APP_VERSION = "3.16.3" // the ZCode whose sign-in this makes
+// APP_VERSION is the ZCode this signs in and asks as, on every call. ZCode
+// gates by it: its marketing feed answers empty to an older one (#678),
+// and its Start Plan balance "judges capability by the real app_version"
+// (zaiStartPlanBilling.ts in zai-org/ZCode@a9fe401, 3.17.2).
+const APP_VERSION = "3.17.2"
 const UA = "ZCode/" + APP_VERSION
 
 // ZCode's models before its config is read; the Start Plan has all but GLM-5.3.
@@ -167,6 +173,11 @@ const uniqueModels = (names) => {
   return [...byName.values()]
 }
 const giftNames = (g) => g?.allModels ?? g?.models ?? []
+// wireModel is a gift model as ZCode sends it: the buckets name it lowercased
+// ("glm-5.3-flash"), the app's request carries its registry id
+// ("GLM-5.3-Flash"; normalizeOfficialGlmModelId's spelling). Names ZCode
+// does not know go as the bucket wrote them.
+const wireModel = (m) => MODELS.find((x) => x.id.toLowerCase() === String(m).toLowerCase())?.id ?? m
 const giftModel = (g, id) => giftNames(g).find((m) => giftID(m).toLowerCase() === id.toLowerCase())
 const bucketModels = (x) => (Array.isArray(x.capabilities) ? x.capabilities : [])
   .map((c) => String(c ?? "").trim()).filter((c) => c.startsWith("model:") || !c.includes(":"))
@@ -186,7 +197,12 @@ const giftSpent = (x) => {
 // the gift when any of them has a live bucket serving it — a bucket past
 // its plan's own end, or one whose remaining_units says none, is skipped
 // rather than asked and refused. models are those live buckets' names.
-async function startPlan(jwt, device) {
+//
+// coming (sign-in only) also takes a plan that has not started yet, as
+// ZCode's own check does (resolveStartPlanBalanceAvailability's "pending"
+// counts as entitled): {name, models: [], coming: true}. Requests and the
+// card never ask for it: a plan not started serves nothing yet.
+async function startPlan(jwt, device, coming = false) {
   if (!jwt) throw new Error("not signed in to ZCode")
   if (jwtExpired(jwt)) throw new Error(EXPIRED)
   const b = (await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, { auth: "Bearer " + jwt, device })) ?? {}
@@ -217,7 +233,11 @@ async function startPlan(jwt, device) {
       }
     }
   }
-  return any ? { name: name || "Start Plan", models: [...ms], allModels: [...all.values()], ttl } : null
+  if (any) return { name: name || "Start Plan", models: [...ms], allModels: [...all.values()], ttl }
+  if (!coming) return null
+  const next = plans.filter((p) => notStarted(p, now) && !(num(p?.ends_at) > 0 && num(p?.ends_at) <= now))
+    .sort((a, b) => startNum(a.starts_at) - startNum(b.starts_at))[0]
+  return next ? { name: String(next.name ?? "").trim() || "Start Plan", models: [], allModels: [], ttl, coming: true } : null
 }
 
 // plansOf says where an account's requests go and what more it can spend:
@@ -275,12 +295,25 @@ async function plansOf(s) {
 // blocked remembers the models a gift said it has none left for: a key+jwt+
 // model for a minute, so one turn that is refused does not ask again.
 const blocked = new Map()
+// sidelined remembers, the same way, the models whose gift turned free
+// first away for another reason (a 405/3012, a block page): free first
+// leaves them on the plan for the minute, but a -Trial entry, the user's
+// own pick of the gift, still asks ZCode and gets its real answer. Once
+// one rest served both, and a refusal under free first answered the
+// Trial entry locally as a quota "exhausted" it never was (Can4ry_ on X).
+const sidelined = new Map()
+const rest = (map, k) => {
+  for (const [x, until] of map) if (Date.now() >= until) map.delete(x)
+  map.set(k, Date.now() + 60_000)
+}
 
 // giftServes: the gift's buckets name their models lowercased ("glm-5.3-
 // flash"); what is asked for arrives as the plan lists it ("GLM-5.3-Flash").
 const giftServes = (gift, m) => (gift.models ?? []).some((x) => x.toLowerCase() === m.toLowerCase())
+const giftRested = (s, m) => Date.now() < (blocked.get(s.key + "\0" + s.jwt + "\0" + m.toLowerCase()) ?? 0)
 const giftUsable = (s, gift, m) => !jwtExpired(s.jwt) && giftServes(gift, m) &&
   Date.now() >= (blocked.get(s.key + "\0" + s.jwt + "\0" + m.toLowerCase()) ?? 0)
+const giftSidelined = (s, m) => Date.now() < (sidelined.get(s.key + "\0" + s.jwt + "\0" + m.toLowerCase()) ?? 0)
 
 // spentUp is the gift saying it has nothing left to spend: its own no-
 // resource-package code 1113, its "exceed quota limit" 1005 — a spent gift
@@ -663,7 +696,8 @@ async function giftOf(s) {
 const CLAIM_HINT = "Gift plans to claim in the ZCode app"
 
 // claimHint is the card's line for gift plans ZCode is holding for the
-// account but has not put on it: GET /billing/preview lists them. The
+// account but has not put on it: the app's banners (marketing/touch)
+// list them (toClaim). The
 // card only names them: they are claimed in the ZCode app, or by the
 // daily claim (claimDaily) when the user turned it on; on 10-06 a claim
 // without the app's Aliyun captcha attestation was refused (3007). A window, set aside (it is no
@@ -676,66 +710,11 @@ const CLAIM_HINT = "Gift plans to claim in the ZCode app"
 // own.
 async function claimHint(s) {
   if (!s.jwt || jwtExpired(s.jwt)) return null
-  // soft both ways: a read that fails is no line at all, never a card or a
-  // refusal of its own (the claim itself decides what a failed read means)
-  let plans
-  try {
-    plans = [...(await previewGifts(s)), ...(await campaignGifts(s))]
-  } catch {
-    return null
-  }
+  const { plans } = await toClaim(s)
   if (!plans.length) return null
   const n = plans.length
   const plan = first(...plans.map((p) => p.name), "ZCode gift plan")
   return { name: CLAIM_HINT, used: 0, aside: true, display: `${n} · ${plan}` }
-}
-
-// previewGifts is /billing/preview's list as {planId, name}: the gift plans
-// ZCode holds for the account that the ZCode app's settings dialog claims
-// by hand. null when the list doesn't read (a plan list that isn't a list,
-// data that isn't an object) — a caller claiming from it must not claim
-// blind; [] when the account has nothing. A read that fails throws, and
-// the caller says what a failed read means for it.
-async function previewGifts(s) {
-  const d = await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${platform()}`, { auth: "Bearer " + s.jwt, device: s.device, headers: zcodeHeaders() })
-  const listed = previewPlans(d)
-  if (!listed) return null
-  return listed
-    .filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim())
-    .map((p) => ({ planId: p.plan_id.trim(), name: first(typeof p?.name === "string" ? p.name : "", p.plan_id.trim()) }))
-}
-
-// campaignGifts is the gift plans ZCode is advertising to this account
-// through a marketing banner. A campaign's plan never appears in
-// /billing/preview — that lists the manual-claim gifts alone — so without
-// this read the Weekend Build looks unclaimable and nothing ever claims it.
-// The client draws the banner's button from action.args.plan_id and posts
-// that id to the same /billing/claim, which is what this does.
-// GET /api/v1/marketing/touch answers {deliveries: [{banner: {buttons:
-// [{action: {type: "claim_zcode_plan", args: {plan_id}}}]}}]}, and the
-// banner's own copy of the plan names it. Soft: a read that fails adds no
-// campaign plan, and never turns a claim into a failure — the preview is
-// what decides that.
-async function campaignGifts(s) {
-  let d
-  try {
-    d = await call("GET", `${ZCODE}/api/v1/marketing/touch?seq=0`, { auth: "Bearer " + s.jwt, device: s.device, headers: zcodeHeaders() })
-  } catch {
-    return []
-  }  const out = []
-  const seen = new Set()
-  for (const del of Array.isArray(d?.deliveries) ? d.deliveries : []) {
-    const named = del?.banner?.background?.args?.zcode_plan
-    for (const b of del?.banner?.buttons ?? []) {
-      const act = b?.action
-      const id = typeof act?.args?.plan_id === "string" ? act.args.plan_id.trim() : ""
-      if (act?.type !== "claim_zcode_plan" || !id || seen.has(id)) continue
-      seen.add(id)
-      const name = first(typeof named?.name === "string" && named.plan_id === id ? named.name : "", id)
-      out.push({ planId: id, name })
-    }
-  }
-  return out
 }
 
 // ---- the daily claim ---------------------------------------------------------------
@@ -749,6 +728,12 @@ async function campaignGifts(s) {
 // (seen 10-06, #30).
 const CLAIMED_ALREADY = 1003
 const CAPTCHA = 3007
+// NOT_ELIGIBLE is /billing/claim's body code for a plan the account is not
+// offered at that moment: HTTP 400 {"code":1004,…}. A stale APP_VERSION
+// answers it for every account at once (11-04: six accounts all answered
+// 1004 under 3.16.3's header, and four of them claimed with code 0 under
+// 3.17.2's, one night, with nothing else changed).
+const NOT_ELIGIBLE = 1004
 const CAPTCHA_WORDS = /captcha/i
 
 // captchaConfig is ZCode's Aliyun captcha scene, as
@@ -791,19 +776,21 @@ function getAttestation(s) {
   return a
 }
 
-// zcodeHeaders are what the ZCode app sends on its billing calls beside
-// the session (#503's capture): its version and platform.
-const zcodeHeaders = () => ({ "X-ZCode-App-Version": APP_VERSION, "X-Platform": platform() })
+// The marketing feed and the claim are gated on the client's version:
+// under an older version's header the feed answers empty (11-03, #678:
+// the day's banner showed for 3.17.2 and for no older one), so they go,
+// as every call does, as the current client (APP_VERSION) sends them.
+const marketingHeaders = () => ({ "X-ZCode-App-Version": APP_VERSION, "X-Platform": platform(), "X-Client-Language": clientLanguage() })
 
 // claimOne asks /billing/claim for one plan and says what its body says:
 // "claimed" (code 0), "done" (code 1003, claimed before), "captcha" (the
 // claim wants the app's captcha), else "failed" with why. Only a body
 // that reads decides: an HTTP error without one, or text that isn't
-// JSON, is failed (unknown), never claimed. The code 0 body hasn't been
-// seen yet, so nothing but its code is read.
+// JSON, is failed (unknown), never claimed. Only the code is read (#503
+// has a real code 0 reply, "Plan claimed successfully.").
 async function claimOne(s, planID, attestation) {
   let res, text
-  const h = { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA, Authorization: "Bearer " + s.jwt, "X-Device-Mid": s.device || anyDevice, ...zcodeHeaders() }
+  const h = { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA, Authorization: "Bearer " + s.jwt, "X-Device-Mid": s.device || anyDevice, ...marketingHeaders() }
   // the attestation a page's traceless check produced, when it is had: a
   // guarded claim is refused with 3007 without it
   if (attestation?.param) {
@@ -828,55 +815,138 @@ async function claimOne(s, planID, attestation) {
   const msg = typeof env?.msg === "string" ? env.msg : ""
   if (code === CAPTCHA || CAPTCHA_WORDS.test(msg)) return { outcome: "captcha", why: msg || `code ${code}` }
   if (code === CLAIMED_ALREADY) return { outcome: "done" }
+  if (code === NOT_ELIGIBLE) return { outcome: "ineligible", why: msg || `code ${code}` }
   if (code === 0 && res.ok) return { outcome: "claimed" }
   if (!Number.isFinite(code)) return { outcome: "failed", why: `HTTP ${res.status}, unreadable reply ${String(text ?? "").trim().slice(0, 120) || "(empty)"}` }
   return { outcome: "failed", why: `${msg || "error"} (HTTP ${res.status}, code ${code})` }
 }
 
-// previewPlans is /billing/preview's plan list. An account with nothing to
-// claim is answered {"code":0,"msg":"","logid":…}: no data at all, not
-// "plans": [] (the owner's account read 10-30 for hykql's report on
-// Discord; the list is left out when it is empty). call has already judged the code, so a reply
-// without data, or data without plans, is a list of none. Only data that
-// isn't an object, or plans that are there and aren't a list, don't read
-// (null, unknown).
-function previewPlans(d) {
-  if (d == null) return []
-  if (typeof d !== "object" || Array.isArray(d)) return null
-  if (d.plans == null) return []
-  return Array.isArray(d.plans) ? d.plans : null
+// TOUCH is ZCode's marketing feed: the ZCode app's claim banners come
+// from it. A banner plan ("ZCODE WEEKEND BUILD", 10-30) is served only
+// while the app shows its banner, and the app claims it through the same
+// /billing/claim (#503's capture of 10-30, kongbai01203: GET
+// /api/v1/marketing/touch?seq=<n, counting up from 0> with the session,
+// X-Device-Mid, X-Client-Language and X-ZCode-App-Version, answered
+// data.deliveries[].banner.buttons[].action = {"type":"claim_zcode_plan",
+// "args":{"plan_id":…}} and the plan's name in
+// banner.background.args.zcode_plan.name). The v3.17 client reads this
+// feed alone: the old preview polling is gone, and the rewards center's
+// gifts are the rewards website's, claimed in the client.
+const TOUCH = "/api/v1/marketing/touch"
+const CLAIM_ACTION = "claim_zcode_plan"
+// touchSeq is the feed's seq: ZCode's own count of its feed requests
+// since the process started, from 0, one GET per refresh. It is not a
+// page: "仅供服务端日志定位，不改变投放判断" (docs/marketing-touch-client.md,
+// marketingTouchService.ts's bootRequestSeq, zai-org/ZCode@a9fe401), so a
+// check-in asks once, never seq 0..8 in a row (plugins#676), and a banner
+// seen at one seq and not another is a delivery arriving later.
+let touchSeq = 0
+// clientLanguage is the language ZCode names to marketing/touch: zh-CN or
+// en-US, its two UI languages, never another (marketingTouchService's
+// localeSchema), so a computer set to zh-Hans-CN or en-GB asks as ZCode does.
+const clientLanguage = () => {
+  let l = ""
+  try {
+    l = Intl.DateTimeFormat().resolvedOptions().locale || ""
+  } catch {}
+  return /^zh\b/i.test(l) ? "zh-CN" : "en-US"
 }
 
-// claimDaily claims every gift plan ZCode's preview lists for the account
-// (#503), as auth.checkin's answer: inactive when it lists none, claimed
-// when one was claimed now, done when each was claimed before, captcha
-// when ZCode wants the app's captcha for one (it is claimed in the ZCode
-// app), failed when the list or a claim can't be read. A failed one is
-// asked again later in the day, when a plan claimed now answers 1003.
+// touchPlans is the plans marketing/touch's deliveries offer to claim:
+// [{plan_id, name}], [] for a feed with no deliveries, null for one that
+// doesn't read. Each delivery is searched for its claim_zcode_plan
+// actions and its zcode_plan's name, wherever the banner keeps them, so
+// a button moved inside the banner is still found.
+function touchPlans(d) {
+  if (d == null) return []
+  if (typeof d !== "object" || Array.isArray(d)) return null
+  if (d.deliveries == null) return []
+  if (!Array.isArray(d.deliveries)) return null
+  const out = []
+  for (const dv of d.deliveries) {
+    const ids = [], names = []
+    const walk = (v, depth) => {
+      if (!v || typeof v !== "object" || depth > 12) return
+      if (Array.isArray(v)) return v.forEach((x) => walk(x, depth + 1))
+      if (v.type === CLAIM_ACTION && typeof v.args?.plan_id === "string" && v.args.plan_id.trim()) ids.push(v.args.plan_id.trim())
+      if (v.zcode_plan && typeof v.zcode_plan === "object" && typeof v.zcode_plan.name === "string") names.push(v.zcode_plan.name)
+      for (const k of Object.keys(v)) walk(v[k], depth + 1)
+    }
+    walk(dv, 0)
+    for (const id of ids) out.push({ plan_id: id, name: first(names[0] ?? "", id) })
+  }
+  return out
+}
+
+// toClaim is every gift plan the account can claim: what the app's
+// marketing feed offers (its banners). The v3.17 client replaced the old
+// preview polling with the feed alone (docs/marketing-touch-client.md in
+// zai-org/ZCode), so the preview is read no more; a rewards center's gift
+// lives on the rewards website, outside this API, and is claimed in the
+// client. unread names a feed that didn't read: its plans are unknown,
+// never none.
+async function toClaim(s) {
+  const plans = [], unread = []
+  const add = (p) => {
+    if (!plans.some((q) => q.plan_id === p.plan_id)) plans.push(p)
+  }
+  let d
+  try {
+    d = await call("GET", `${ZCODE}${TOUCH}?seq=${touchSeq++}`, { auth: "Bearer " + s.jwt, device: s.device, headers: marketingHeaders() })
+  } catch (e) {
+    unread.push(`gift plans to claim: ${e?.message ?? String(e)}`)
+    return { plans, unread }
+  }
+  const got = touchPlans(d)
+  if (!got) unread.push("gift plans to claim: the plan list doesn't read")
+  else got.forEach(add)
+  return { plans, unread }
+}
+
+// RECHECK is how long an "nothing to claim" stands before magpie's loop
+// asks again: ZCode drops gift plans into the feed during the day (a
+// weekend banner, say) on its own schedule, and the day's ask
+// may have run hours before, so an inactive settled for the day lets a
+// plan sit unclaimed past its short life (the weekend plan of
+// testdata/touch-1030-wk.json starts 19:00 Beijing). `until` wakes the
+// loop again in half an hour, and it asks again all day while neither
+// list names a plan — two GETs and no claim posted. The other settled
+// answers stand for the day: a claimed plan leaves the feed, so asking
+// a claimed account again half an hour later finds nothing and flips
+// its card from "Checked in today" to "No check-in event now"; a
+// captcha plan re-asked makes ZCode demand its captcha again each time,
+// and a done plan re-asked posts a claim it already answered 1003. The
+// same shape as Qoder's campaign that opens mid-day, asked again on
+// magpie's side there (yetone/magpie#2696). A failed needs no until:
+// magpie asks a failed again after 30 minutes of its own.
+const RECHECK_MS = 30 * 60_000
+const recheck = () => new Date(Date.now() + RECHECK_MS).toISOString()
+
+// claimDaily claims every gift plan ZCode offers the account (#503:
+// toClaim, the app's banners and its preview), as auth.checkin's answer:
+// inactive when neither lists one, claimed when one was claimed now,
+// done when each was claimed before, captcha when ZCode wants the app's
+// captcha for one (it is claimed in the ZCode app), ineligible when
+// ZCode is not offering one at that moment (code 1004, read again later
+// in the day), failed when a list
+// or a claim can't be read. A failed one is asked again later in the
+// day, when a plan claimed now answers 1003. An inactive stands only
+// until RECHECK_MS from now, so a plan dropped into the feed later in
+// the day is still claimed; the other settled answers stand for the day
+// (see RECHECK).
 // Nothing here marks the account: a failed claim keeps its sign-in.
 async function claimDaily(s) {
   if (!s?.jwt) return { outcome: "ineligible", message: "ZCode's gift plans are claimed with a ZCode sign-in; this account has none" }
   if (jwtExpired(s.jwt)) return { outcome: "failed", message: EXPIRED }
-  // both lists: the manual-claim gifts /billing/preview names, and the
-  // campaign gifts a marketing banner is advertising (the Weekend Build
-  // never appears in preview). The preview is what says whether the claim
-  // can be made at all: a read that fails is failed (unknown), never a
-  // claim blind, and the campaign read is soft beside it.
-  let plans
-  try {
-    const listed = await previewGifts(s)
-    if (!listed) return { outcome: "failed", message: "gift plans to claim: the plan list doesn't read" }
-    plans = [...listed, ...(await campaignGifts(s))]
-  } catch (e) {
-    return { outcome: "failed", message: `gift plans to claim: ${e?.message ?? String(e)}` }
-  }
-  if (!plans.length) return { outcome: "inactive", message: "no ZCode gift plan to claim" }
+  const { plans, unread } = await toClaim(s)
+  if (!plans.length && unread.length) return { outcome: "failed", message: unread.join("; ") }
+  if (!plans.length) return { outcome: "inactive", message: "no ZCode gift plan to claim", until: recheck() }
   const got = []
   // the attestation a page solved this account's captcha into, when it is
   // had: a guarded claim is refused with 3007 without one
   let att = getAttestation(s)
   for (const p of plans) {
-    const r = await claimOne(s, p.planId, att)
+    const r = await claimOne(s, p.plan_id, att)
     // the attestation was missing or no longer good: drop it, so the page
     // is asked for a fresh one rather than the same stale param twice
     if (r.outcome === "captcha" && att) {
@@ -890,13 +960,20 @@ async function claimDaily(s) {
   const said = [
     claimed.length ? `claimed ${claimed.join(", ")}` : "",
     ...got.filter((g) => g.outcome === "captcha").map((g) => `${g.name}: claim it in the ZCode app (${g.why})`),
+    ...got.filter((g) => g.outcome === "ineligible").map((g) => `${g.name}: ${g.why}`),
     ...got.filter((g) => g.outcome === "failed").map((g) => `${g.name}: ${g.why}`),
+    ...unread,
   ].filter(Boolean).join("; ")
   // a plan claimed now is used by the next request, not ten minutes on
   if (claimed.length) routes.delete(s.key + "\0" + s.jwt)
-  if (got.some((g) => g.outcome === "failed")) return { outcome: "failed", message: said }
+  // a list that didn't read may hold a plan not claimed: asked again
+  if (unread.length || got.some((g) => g.outcome === "failed")) return { outcome: "failed", message: said }
   if (got.some((g) => g.outcome === "captcha")) return { outcome: "captcha", message: said }
   if (claimed.length) return { outcome: "claimed", message: said }
+  // a plan not offered now can be offered later in the day (11-04: an
+  // account's GLOBAL BUILD banner showed 28 minutes after it signed in),
+  // so an ineligible is read again half an hour out, as an inactive is
+  if (got.some((g) => g.outcome === "ineligible")) return { outcome: "ineligible", message: said, until: recheck() }
   return { outcome: "done", message: `already claimed: ${named("done").join(", ")}` }
 }
 
@@ -1269,7 +1346,7 @@ async function signedIn(site, token, jwt, device, onTeam = false) {
   let berr = null
   if (jwt) {
     try {
-      const sp = await startPlan(jwt, device)
+      const sp = await startPlan(jwt, device, true)
       if (sp) return { ...(err || !s?.key ? { base: SITES[site].base } : s), jwt, plan: sp.name }
     } catch (e) {
       berr = e
@@ -1282,8 +1359,7 @@ async function signedIn(site, token, jwt, device, onTeam = false) {
     if (!berr && !jwtExpired(jwt)) {
       let claimable = []
       try {
-        const s = { jwt, device }
-        claimable = [...(await previewGifts(s)), ...(await campaignGifts(s))]
+        claimable = (await toClaim({ jwt, device })).plans
       } catch {}
       if (claimable.length) {
         const names = [...new Set(claimable.map((p) => p.name))]
@@ -1827,6 +1903,13 @@ function kept(res, text) {
 // (https://docs.z.ai/devpack/usage-policy), so a number written here would
 // hold a Max account to a Lite one's, with no way for the user to raise it.
 const DEFAULT_CONCURRENCY = 3
+// DEFAULT_ACCOUNTS is how many of a user's ZCode accounts magpie sends
+// requests to at the same time (maxAccounts, on the auth hook and in
+// package.json): the first in the user's list, the next taking over once
+// one runs out or fails. 01huadalang on Discord: three accounts used at
+// once from one address got the address refused with a 405, two didn't. A
+// user sets their own on the provider (Accounts at once), 0 for no limit.
+const DEFAULT_ACCOUNTS = 2
 const BUSY_CODES = new Set(["3008", "3009"])
 // BUSY_WAITS are the waits between asks, longest last: about ten seconds of
 // them. Past that the account is saturated rather than busy, and magpie's
@@ -1950,6 +2033,33 @@ const START_REFUSED = /unusual activity|request has been blocked|"code"\s*:\s*"?
 // startRefused says a Start Plan answer is a refusal: a 405, a block page
 // or code 3012.
 const startRefused = (status, text) => status >= 400 && (status === 405 || START_REFUSED.test(text))
+
+// edge is the hold a block page puts on this computer's address: zcode.z.ai
+// (the Start Plan, a gift) is not asked again until edge.until, and its
+// requests are answered here with the same 405 and START_EDGE, so magpie
+// still reads them as the network's (provider.EdgeBlocked) and asks the
+// group's next provider. Every account of this process goes out from the
+// one address, so the hold is the process's, not an account's. Asking on
+// while the address is blocked, from every account and every session, only
+// knocks again on a firewall that is counting (plugins#649: two accounts,
+// three sessions and their subagents, and ZCode's own app blocked too; a
+// block in #369 lasted about seven minutes). EDGE_HOLD is short enough that
+// a user who switched network or proxy waits little for it.
+const EDGE_HOLD = 3 * 60_000
+const edge = { until: 0 }
+const edgeHeld = () => Date.now() < edge.until
+
+function hhmm(t) {
+  const d = new Date(t)
+  return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0") + ":" + String(d.getSeconds()).padStart(2, "0")
+}
+
+// edgeHeldAnswer is a held request's answer: the block page's status and
+// meaning, and until when this computer holds off.
+function edgeHeldAnswer() {
+  const error = { type: "permission_error", message: `405 ${STATUS_TEXT[405]} — ${START_EDGE} (ZCode's Start Plan is not asked again from here until ${hhmm(edge.until)}, plugins#649)` }
+  return new Response(JSON.stringify({ type: "error", error }), { status: 405, statusText: STATUS_TEXT[405], headers: { "content-type": "application/json" } })
+}
 
 // startBlocked is the refusal's answer: what the vendor said (its status
 // for a block page), then what it means. A block page is the network's;
@@ -2156,23 +2266,22 @@ function workPlace(h) {
   return place
 }
 
-// environment is the prompt's environment section; provider and model
-// name the powered-by line, left out with no model. The plugin runs in
-// magpie, not in the agent's folder: the working directory and whether it
-// is a git repository are the agent's, as magpie tells them (place), and
-// each is left out when it isn't told rather than said as magpie's own
-// (#86). The agent's shell isn't known here either, so it isn't said; the
-// platform and OS version are this computer's, as ZCode's X-Os-* headers
-// say them.
-function environment(provider, model, place = {}) {
+// environment is the prompt's environment section, as ZCode 3.17.2's
+// env-info.ts renders it, bullets one space in. The plugin runs in magpie,
+// not in the agent's folder: the working directory and whether it is a git
+// repository are the agent's, as magpie tells them (place), and each is
+// left out when it isn't told rather than said as magpie's own (#86). The
+// agent's shell isn't known here either, so it isn't said; the platform
+// and OS version are this computer's, as ZCode's X-Os-* headers say them.
+function environment(place = {}) {
   const e = PROMPT.environment
   const lines = [e.heading, e.invokedLine]
   if (place.dir) {
-    lines.push(`- ${e.cwdLabel}: ${place.dir}`)
-    if (place.git) lines.push(`- ${e.gitLabel}: ${place.git === "yes" ? "yes" : e.gitNo}`)
+    lines.push(` - ${e.cwdLabel}: ${place.dir}`)
+    if (place.git) lines.push(` - ${e.gitLabel}: ${place.git === "yes" ? e.gitYes : e.gitNo}`)
   }
-  lines.push(`- ${e.platformLabel}: ${process.platform}`, `- ${e.osVersionLabel}: ${osVersion()}`)
-  if (model) lines.push(e.poweredByLine.replace("{provider}", provider).replace("{model}", model))
+  lines.push(` - ${e.platformLabel}: ${process.platform}`, ` - ${e.osVersionLabel}: ${osVersion()}`)
+  lines.push(` - ${e.untrustedNote}`)
   return lines.join("\n")
 }
 
@@ -2183,11 +2292,11 @@ function today(now = new Date()) {
 }
 
 // contextPrefix is the user turn ZCode puts before the agent's: the day in
-// a <system-reminder>, the tags hugging the text.
+// a <system-reminder>, the tags hugging the text, as 3.17.2's current-date
+// section says it alone.
 function contextPrefix() {
   const c = PROMPT.context
-  const body = [c.intro, c.currentDateHeading + "\n" + c.currentDateLine.replace("{date}", today()), "", c.outro].join("\n")
-  return { role: "user", content: [{ type: "text", text: "<system-reminder>" + body + "</system-reminder>" }] }
+  return { role: "user", content: [{ type: "text", text: "<system-reminder>" + c.currentDateLine.replace("{date}", today()) + "</system-reminder>" }] }
 }
 
 // dress is a Messages request body as ZCode sends it: ZCode's three cached
@@ -2211,18 +2320,29 @@ function dress(text, site, device, place, session) {
   const provider = site === "bigmodel" ? "bigmodel-api" : "zai-api"
   const model = typeof b.model === "string" ? b.model : ""
   // The agent's own system text joins the third block, as ZCode's
-  // ContextBuilder (3.14.3, glm/zcode.cjs assembleSystemMessages) joins
-  // every dynamic system section, an added one too, with "\n\n" into
-  // that one block: ZCode never sends more than three. zcode.z.ai turns a
-  // fourth block away with 405/3012 (#343), and the first two must stay
-  // byte for byte ZCode's.
+  // ContextBuilder (3.17.2, core/src/context/builder.ts
+  // assembleSystemMessages) joins every dynamic system section, an added
+  // one too, with "\n\n" into that one block: ZCode never sends more than
+  // three. zcode.z.ai turns a fourth block away with 405/3012 (#343), and
+  // the first two must stay byte for byte ZCode's. The third's own
+  // sections are 3.17.2's dynamic ones — the unheaded behavior paragraphs,
+  // the slash-skill guidance when the request has a Skill tool, the
+  // environment and the model, then context management.
   const own = []
   if (typeof b.system === "string") {
     if (b.system.trim()) own.push(b.system)
   } else if (Array.isArray(b.system)) {
     for (const x of b.system) if (x?.type === "text" && typeof x.text === "string" && x.text.trim()) own.push(x.text)
   }
-  const dynamic = [PROMPT.beforeEnvironment, environment(provider, model, place), PROMPT.afterEnvironment, ...own]
+  const skill = Array.isArray(b.tools) && b.tools.some((t) => t && typeof t === "object" && t.name === "Skill")
+  const dynamic = [
+    PROMPT.dynamicBehavior,
+    ...(skill ? [PROMPT.sessionGuidance] : []),
+    environment(place),
+    ...(model ? [PROMPT.poweredBy.replace("{provider}", provider).replace("{model}", model)] : []),
+    PROMPT.contextManagement,
+    ...own,
+  ]
   b.system = [cached(PROMPT.cliPrefix), cached(PROMPT.stableSections.join("\n\n")), cached("\n\n" + dynamic.join("\n\n"))]
   b.messages = [contextPrefix(), ...b.messages]
   let last = null
@@ -2321,7 +2441,7 @@ function zcodeAccounts() {
 
 // ---- the plugin ------------------------------------------------------------------
 
-export async function ZCodeAuthPlugin({ client }, options = {}) {
+export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
   const log = (message) => {
     try {
       client?.app?.log?.({ body: { service: "zcode-auth", level: "error", message } })
@@ -2329,9 +2449,17 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
   }
   // freeFirst reads the option from the provider config's options first,
   // and from the plugin's own (magpie's Plugins › Options) when the
-  // provider carries no freeFirst of its own.
+  // provider carries no freeFirst of its own. It is on unless one of them
+  // says false: a gift ZCode hands out (each weekend, sgfvdsg86265 on X)
+  // lapses unused behind an agent that asks the plain model, and every
+  // failure of the gift is answered from the plan. magpie's switch in the
+  // provider's editor (FREE_FIRST, auth.options below) turns it off too;
+  // it is on by default, so a JSON freeFirst: false a user wrote before
+  // the switch existed keeps it off. A key magpie doesn't report (an older
+  // magpie, OpenCode) leaves it as the JSON says.
   const freeFirst = (providerOptions) =>
-    providerOptions?.freeFirst !== undefined ? providerOptions.freeFirst === true : options?.freeFirst === true
+    magpie?.options?.(PROVIDER)?.[FREE_FIRST] !== false &&
+    (providerOptions?.freeFirst !== undefined ? providerOptions.freeFirst !== false : options?.freeFirst !== false)
   const oauth = (site) => ({
     type: "oauth",
     label: `ZCode: ${SITES[site].name}${site === "bigmodel" ? " (智谱)" : ""} GLM Coding Plan`,
@@ -2362,7 +2490,9 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
             let plans = []
             let note
             try {
-              plans = [...(await previewGifts(s)), ...(await campaignGifts(s))]
+              const r = await toClaim(s)
+              plans = r.plans
+              if (r.unread.length) note = r.unread.join("; ")
             } catch (e) {
               note = e?.message ?? String(e)
             }
@@ -2374,6 +2504,7 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
       zcode_claim_gifts: {
         description:
           "Claims every ZCode gift plan ZCode is holding for every signed-in account, through the same daily claim magpie's check-in runs. " +
+          "Where a claim needs ZCode's captcha and an attestation was submitted for the account, it goes with it. " +
           "Answers which account got which plan; nothing to claim is not an error.",
         args: {
           type: "object",
@@ -2448,6 +2579,11 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
         // the list it was told last, as the built-in keeps the one it fetched last
         const fell = !ms.length
         if (fell) ms = start ? START_MODELS : MODELS
+        // a gift-only account serves what its balance names, as ZCode
+        // offers it (resolveStartPlanBalanceAvailability): the Start
+        // Plan's config models the balance lacks would only be refused
+        // (young02036). A balance naming none leaves the config's list.
+        if (start && giftNames(gift).length) ms = ms.filter((m) => giftNames(gift).some((x) => x.toLowerCase() === m.id.toLowerCase()))
         const url = s.base + "/v1"
         const out = Object.fromEntries(ms.map((m) => [m.id, model(m, url)]))
         const details = [...ms, ...modelsOf(cfg, planID(START_BASE)), ...modelsOf(cfg, planID(ZAI_BASE)), ...MODELS]
@@ -2483,6 +2619,26 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
       // own cap follows its tier (Max > Pro > Lite) and the time of day, and
       // a user who knows theirs can raise this on the account
       maxConcurrency: DEFAULT_CONCURRENCY,
+      // how many accounts take requests at once, the others in reserve
+      // (DEFAULT_ACCOUNTS); a magpie that doesn't read it uses them all
+      maxAccounts: DEFAULT_ACCOUNTS,
+      // magpie's own switches (OpenCode never reads auth.options), read at
+      // each request through input.magpie
+      options: [
+        {
+          key: FREE_FIRST,
+          label: "Free quota first",
+          description: "When on, the plain GLM models spend ZCode's free Start Plan quota (the -Trial entries' quota) before the GLM Coding Plan, and go to the plan when it is spent or refused. Off: only the -Trial entries use it. freeFirst: false in the options JSON turns it off too.",
+          labels: { zh: "优先用免费额度", "zh-TW": "優先用免費額度", ja: "無料枠を優先", de: "Gratis-Kontingent zuerst" },
+          descriptions: {
+            zh: "开启后，普通的 GLM 模型先用 ZCode 的免费 Start Plan 额度（即 -Trial 条目的额度），用完或被拒时再用 GLM Coding Plan。关闭后只有 -Trial 条目会用它。选项 JSON 里的 freeFirst: false 也会关闭它。",
+            "zh-TW": "開啟後，一般的 GLM 模型先用 ZCode 的免費 Start Plan 額度（即 -Trial 項目的額度），用完或被拒時再用 GLM Coding Plan。關閉後只有 -Trial 項目會用它。選項 JSON 裡的 freeFirst: false 也會關閉它。",
+            ja: "オンにすると、通常の GLM モデルは GLM Coding Plan より先に ZCode の無料 Start Plan 枠（-Trial 項目の枠）を使い、使い切るか拒否されるとプランに戻ります。オフでは -Trial 項目だけが使います。オプション JSON の freeFirst: false でもオフになります。",
+            de: "Ist dies an, nutzen die normalen GLM-Modelle zuerst ZCodes freies Start-Plan-Kontingent (das der -Trial-Einträge) und erst danach den GLM Coding Plan. Aus: nur die -Trial-Einträge nutzen es. freeFirst: false im Optionen-JSON schaltet es auch aus.",
+          },
+          default: true,
+        },
+      ],
       async loader(getAuth, provider) {
         const s0 = stateOf(await getAuth())
         if (!s0) return {}
@@ -2530,13 +2686,13 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
                 const raw = giftModel(gift, m)
                 const available = raw && giftUsable(s, gift, raw)
                 if (!available) {
-                  const error = { type: raw ? "rate_limit_error" : "invalid_request_error", message: raw ? `ZCode's limited quota for ${raw} is exhausted or temporarily unavailable` : `ZCode has no active limited quota for ${m}` }
+                  const error = { type: raw ? "rate_limit_error" : "invalid_request_error", message: raw ? `${giftRested(s, raw) ? `ZCode said the last request for ${raw} was over its quota, so it is not asked again for a minute: ` : ""}ZCode's limited quota for ${raw} is exhausted or temporarily unavailable` : `ZCode has no active limited quota for ${m}` }
                   return kept(new Response(JSON.stringify({ type: "error", error }), { status: raw ? 429 : 400, headers: { "content-type": "application/json" } }))
                 }
-                orig = opts.body = JSON.stringify({ ...JSON.parse(orig), model: raw })
+                orig = opts.body = JSON.stringify({ ...JSON.parse(orig), model: wireModel(raw) })
                 m = raw
                 forcedGift = true
-              } else if (!alone && freeFirst(provider?.options) && s.jwt && known && giftUsable(s, known, m)) {
+              } else if (!alone && !edgeHeld() && freeFirst(provider?.options) && s.jwt && known && giftUsable(s, known, m) && !giftSidelined(s, m)) {
                 // free first: the plain model spends the account's own live
                 // gift before it spends the coding plan, under the name the
                 // gift lists. The gift is the route's cache alone (a failed
@@ -2546,7 +2702,7 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
                 // it was. A refusal past this check is replayed on the plan
                 // in the same request (replayOnPlan below).
                 const raw = giftNames(known).find((x) => x.toLowerCase() === m.toLowerCase())
-                orig = opts.body = JSON.stringify({ ...JSON.parse(orig), model: raw })
+                orig = opts.body = JSON.stringify({ ...JSON.parse(orig), model: wireModel(raw) })
                 m = raw
                 freeGift = true
               }
@@ -2564,13 +2720,14 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
             const askedUrl = url
             const place = workPlace(h)
             const sid = sessionOf(h.get("x-session-id"), s.device)
-            // restModel is the gift saying this model has nothing left: the
-            // model rests a minute (blocked) and the route is dropped, so
-            // the requests behind it re-read the balance and go straight to
-            // the plan.
-            const restModel = () => {
-              for (const [k, until] of blocked) if (Date.now() >= until) blocked.delete(k)
-              blocked.set(s.key + "\0" + s.jwt + "\0" + asked.toLowerCase(), Date.now() + 60_000)
+            // restModel is free first's gift turning this model away: the
+            // model rests a minute and the route is dropped, so the requests
+            // behind it re-read the balance and go straight to the plan. A
+            // quota answer rests it in blocked, which a -Trial entry obeys
+            // too; any other refusal (spent false) in sidelined, which only
+            // free first reads.
+            const restModel = (spent) => {
+              rest(spent ? blocked : sidelined, s.key + "\0" + s.jwt + "\0" + asked.toLowerCase())
               routes.delete(s.key + "\0" + s.jwt)
             }
             // replayOnPlan is free first's answer to a gift that refused
@@ -2596,6 +2753,10 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
               delete opts.duplex
               return askBusy(u, opts, h2)
             }
+            // a block page held this computer off zcode.z.ai (edge): the
+            // Start Plan and a picked gift are answered here; free first
+            // already left the gift for the plan
+            if (start && edgeHeld()) return kept(edgeHeldAnswer())
             if (start) {
               if (jwtExpired(s.jwt)) throw new Error(EXPIRED)
               if (!s.jwt) throw new Error("ZCode's sign-in has no key; sign in again")
@@ -2654,8 +2815,10 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
                 // a key account sent to the Start Plan (its plan list read
                 // none) reads its plans again on the next request, so a
                 // coding plan that is there after all is used (#369)
+                // a block page holds every request off zcode.z.ai a while
+                if (EDGE_PAGE.test(text)) edge.until = Date.now() + EDGE_HOLD
                 if (freeGift) {
-                  restModel()
+                  restModel(false)
                   return done(kept(await replayOnPlan()))
                 }
                 if (s.key && !forcedGift) routes.delete(s.key + "\0" + s.jwt)
@@ -2683,10 +2846,7 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
                 const text = await res.text()
                 const spent = spentUp(text, res.status)
                 if (!spent && res.status < 400) return done(kept(res, text))
-                if (spent) {
-                  for (const [k, until] of blocked) if (Date.now() >= until) blocked.delete(k)
-                  blocked.set(s.key + "\0" + s.jwt + "\0" + modelOf(orig).toLowerCase(), Date.now() + 60_000)
-                }
+                if (spent) rest(blocked, s.key + "\0" + s.jwt + "\0" + modelOf(orig).toLowerCase())
                 return spent && res.status < 400 ? kept(new Response(text, { status: 429, headers: res.headers })) : done(kept(res, text))
               }
             }
@@ -2706,7 +2866,7 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
                 const cap = busy(res.status, text)
                 const spent = !cap && spentUp(text, res.status)
                 if (spent) {
-                  restModel()
+                  restModel(true)
                   return done(kept(await replayOnPlan()))
                 }
                 if (res.status >= 400) {
@@ -2766,25 +2926,17 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
             card = saved(gift || giftReadable(s) ? await dualUsage(s, team) : team)
           } else card = saved(start ? await startUsage(s) : gift || giftReadable(s) ? await dualUsage(s) : await codingUsage(s))
           // a gift plan ZCode holds for the account but has not put on it:
-          // named on the card, claimed by checkin (see claimDaily). The
-          // line goes on a card that has an error too: an account with no
-          // coding plan is exactly the one a gift is waiting for, and the
-          // error said "no plan" while the gift sat unclaimed. The line is
-          // set aside, so it stops nothing.
-          const hint = await claimHint(s)
-          if (hint) {
-            card.windows = [...(card.windows ?? []), hint]
-            // the account is not "no plan" after all: it holds one to
-            // claim, so the card names it instead of only refusing
-            if (card.error) {
-              delete card.error
-              card.plan = first(hint.display.replace(/^\d+\s*·\s*/, ""), card.plan, "ZCode gift plan")
-            }
+          // named on the card, claimed in the ZCode app (its claim needs
+          // the app's captcha attestation, see claimHint). A card that is
+          // an error keeps its error and asks nothing
+          if (!card.error) {
+            const hint = await claimHint(s)
+            if (hint) card.windows = [...(card.windows ?? []), hint]
+            // a key, or a ZCode session that ran out: no gift read, so no
+            // -Trial models, said on the card rather than left out unsaid
+            const need = start ? null : giftSignIn(s, auth?.type === "api")
+            if (need) card.windows = [...(card.windows ?? []), need]
           }
-          // a key, or a ZCode session that ran out: no gift read, so no
-          // -Trial models, said on the card rather than left out unsaid
-          const need = start ? null : giftSignIn(s, auth?.type === "api")
-          if (need) card.windows = [...(card.windows ?? []), need]
           return card
         } catch (e) {
           return saved({ error: e?.message ?? String(e) })
@@ -2873,4 +3025,4 @@ export async function ZCodeAuthPlugin({ client }, options = {}) {
 // config sets what zcodeConfig has read, for tests: null is ZCode's config
 // out of reach, undefined forgets it
 const config = (cfg) => (cfgCache = cfg === undefined ? null : { cfg, at: Date.now() })
-export const _internal = { config, entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, previewGifts, campaignGifts, claimDaily, captchaConfig, putAttestation, getAttestation, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY }
+export const _internal = { edge, EDGE_HOLD, config, entry, limitWindows, termOf, startUsage, routes, blocked, sidelined, plansOf, giftOf, dualUsage, claimHint, claimDaily, claimOne, toClaim, touchPlans, captchaConfig, putAttestation, getAttestation, zcodeAccounts, magpieHome, signedIn, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY, DEFAULT_ACCOUNTS }

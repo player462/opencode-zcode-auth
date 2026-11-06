@@ -1,12 +1,14 @@
 {
   "name": "opencode-zcode-auth",
-  "version": "0.1.40",
-  "description": "OpenCode / magpie provider plugin for ZCode (Z.ai + BigModel GLM Coding Plan): claims the gift plans ZCode holds or advertises (Weekend Build, Global Build, 1024 Dev Day, Start Plan, Trust Build) through the app's own captcha-checked claim",
+  "version": "0.1.52",
+  "description": "OpenCode / magpie provider plugin for ZCode (Z.ai + BigModel GLM Coding Plan): signs in like ZCode 3.17.2, claims the gift plans ZCode advertises (Weekend Build, Global Build, 1024 Dev Day, Start Plan, Trust Build), and solves the Aliyun captcha a guarded claim asks for when the app's attestation is supplied",
   "type": "module",
-  "main": "./index.mjs",
-  "exports": "./index.mjs",
+  "main": "./opencode.mjs",
+  "exports": { ".": "./opencode2.mjs" },
   "files": [
     "index.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
     "prompt.mjs",
     "README.md",
     "page"
@@ -28,6 +30,7 @@
   },
   "magpie": {
     "maxConcurrency": 3,
+    "maxAccounts": 2,
     "page": {
       "title": "ZCode gifts",
       "titles": {
