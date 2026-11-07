@@ -3,10 +3,19 @@
 // makes the captchaVerifyParam, the claim sends it as the app sends it),
 // the tools that list and claim every account's gifts from one call, and
 // the sign-in that keeps an account with no plan but a gift waiting.
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, mock, test } from "bun:test"
 import { homedir, tmpdir } from "node:os"
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+
+// the solver is a real browser run; tests stand in for it
+mock.module("./attest.mjs", () => ({
+  solveCaptcha: async (scene) => {
+    globalThis.__solverCalls = (globalThis.__solverCalls ?? 0) + 1
+    if (globalThis.__solverScene) globalThis.__solverScene.push(scene)
+    return scene?.sceneId ? { param: "auto-solved-param", region: scene.region } : { error: "no captcha scene" }
+  },
+}))
 
 if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run in HOME=$(mktemp -d) bun test")
 const { ZCodeAuthPlugin, _internal } = await import("./index.mjs")
@@ -46,6 +55,9 @@ beforeEach(() => {
   claimReply = null
   feed = banner()
   captchaOn = true
+  globalThis.__solverCalls = 0
+  globalThis.__solverScene = []
+  delete process.env.ZCODE_ATTEST
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     const headers = Object.fromEntries(new Headers(init.headers ?? {}))
@@ -71,16 +83,48 @@ const oauth = () => ({ type: "oauth", access: "", refresh: JSON.stringify({ site
 const claimCalls = () => calls.filter((c) => c.path.endsWith("/claim"))
 
 test("a guarded claim answers captcha, and the submitted attestation claims it", async () => {
-  // first claim: ZCode wants its captcha; the second, with the param, is code 0
+  // first claim: ZCode wants its captcha; the retried one, with the
+  // solver's fresh param, is code 0
   claimReply = (n) => n === 1
     ? env(3007, "captcha verify failed", null, 400)
     : env(0, "Plan claimed successfully.", { server_time: now, plan: { plan_id: WK, status: "active" } })
 
   const h = await hooks()
-  const first = await h.auth.checkin(async () => oauth(), { id: "zcode" })
-  expect(first.outcome).toBe("captcha")
-  expect(first.message).toContain("claim it in the ZCode app")
+  const r = await h.auth.checkin(async () => oauth(), { id: "zcode" })
+  expect(r.outcome).toBe("claimed")
+  expect(r.message).toContain(WK_NAME)
 
+  // the solver ran once, on ZCode's own scene, and its param went on the retry
+  expect(globalThis.__solverCalls).toBe(1)
+  expect(globalThis.__solverScene[0]?.sceneId).toBe("11xygtvd")
+  const claim = claimCalls().at(-1)
+  expect(claim.headers["x-aliyun-captcha-verify-param"]).toBe("auto-solved-param")
+  expect(claim.headers["x-aliyun-captcha-verify-region"]).toBe("cn")
+  // and the claim goes as the current client does: the feed and the claim
+  // are version-gated (upstream #678: an older header answers nothing)
+  expect(claim.headers["x-zcode-app-version"]).toBe("3.17.2")
+  // the spent param is not kept: the next claim makes a fresh one
+  expect(_internal.getAttestation(_internal.stateOf(oauth()))).toBeNull()
+})
+
+test("ZCODE_ATTEST=off leaves the claim as captcha for the page to answer", async () => {
+  claimReply = () => env(3007, "captcha verify failed", null, 400)
+  process.env.ZCODE_ATTEST = "off"
+  const h = await hooks()
+  const r = await h.auth.checkin(async () => oauth(), { id: "zcode" })
+  expect(r.outcome).toBe("captcha")
+  expect(r.message).toContain("claim it in the ZCode app")
+  expect(globalThis.__solverCalls).toBe(0)
+  expect(claimCalls().length).toBe(1)
+})
+
+test("the submitted attestation claims it when the solver is off", async () => {
+  claimReply = (n, headers) => headers["x-aliyun-captcha-verify-param"] === "captcha-param-from-the-page"
+    ? env(0, "Plan claimed successfully.", { server_time: now, plan: { plan_id: WK, status: "active" } })
+    : env(3007, "captcha verify failed", null, 400)
+  process.env.ZCODE_ATTEST = "off"
+
+  const h = await hooks()
   const att = { param: "captcha-param-from-the-page", region: "cn" }
   const r = await h.auth.submitClaimAttestation(async () => oauth(), att)
   expect(r.outcome).toBe("claimed")
@@ -88,9 +132,6 @@ test("a guarded claim answers captcha, and the submitted attestation claims it",
   const claim = claimCalls().at(-1)
   expect(claim.headers["x-aliyun-captcha-verify-param"]).toBe(att.param)
   expect(claim.headers["x-aliyun-captcha-verify-region"]).toBe("cn")
-  // and the claim goes as the current client does: the feed and the claim
-  // are version-gated (upstream #678: an older header answers nothing)
-  expect(claim.headers["x-zcode-app-version"]).toBe(_internal.APP_VERSION ?? "3.17.2")
 })
 
 test("the captcha scene comes from ZCode's own client configs", async () => {

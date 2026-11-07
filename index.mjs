@@ -21,6 +21,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs"
 import { arch, homedir, release, userInfo } from "node:os"
 import { isAbsolute, join } from "node:path"
 import PROMPT from "./prompt.mjs"
+import { solveCaptcha } from "./attest.mjs"
 
 const PROVIDER = "zcode"
 // FREE_FIRST is magpie's switch for free first in the provider's editor
@@ -943,16 +944,35 @@ async function claimDaily(s) {
   if (!plans.length) return { outcome: "inactive", message: "no ZCode gift plan to claim", until: recheck() }
   const got = []
   // the attestation a page solved this account's captcha into, when it is
-  // had: a guarded claim is refused with 3007 without one
+  // had: a guarded claim is refused with 3007 without one. When none is
+  // had and the first claim says captcha, the scene's traceless check is
+  // solved right here (attest.mjs, the way the app's renderer does it) and
+  // the claim is asked once more with the fresh param — measured passing on
+  // 11-07; the param is single-use, so every claim gets its own.
   let att = getAttestation(s)
+  let solver = null
   for (const p of plans) {
-    const r = await claimOne(s, p.plan_id, att)
-    // the attestation was missing or no longer good: drop it, so the page
-    // is asked for a fresh one rather than the same stale param twice
+    let r = await claimOne(s, p.plan_id, att)
     if (r.outcome === "captcha" && att) {
+      // the param was missing or no longer good: drop it, so a fresh one is
+      // made rather than the same stale param twice
       attestations.delete(attestKey(s))
       att = null
     }
+    if (r.outcome === "captcha" && !att && process.env.ZCODE_ATTEST !== "off" && solver === null) {
+      // solve the scene here, once per claim run, and spend it on the plan
+      // that asked for it
+      const scene = await captchaConfig().catch(() => null)
+      solver = scene ? await solveCaptcha(scene) : { error: "no captcha scene" }
+      if (solver.param) {
+        putAttestation(s, solver)
+        r = await claimOne(s, p.plan_id, solver)
+        if (r.outcome === "captcha") attestations.delete(attestKey(s))
+      }
+    }
+    // the param is single-use: spent (claimed) or refused (captcha), it is
+    // no good to the next claim, which makes a fresh one
+    if ((r.outcome === "claimed" || r.outcome === "captcha") && (att || solver?.param)) attestations.delete(attestKey(s))
     got.push({ name: p.name, ...r })
   }
   const named = (o) => got.filter((g) => g.outcome === o).map((g) => g.name)
@@ -2872,6 +2892,26 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
                 if (res.status >= 400) {
                   if (!cap && (res.status === 401 || res.status === 403)) routes.delete(s.key + "\0" + s.jwt)
                   return done(kept(await replayOnPlan()))
+                }
+                return done(kept(res, text))
+              }
+            }
+            // a gift-only account's plain model: the Start Plan answering
+            // 1005/1113 inside a 200 is the account having no gift to spend
+            // ("exceed quota limit" read as 余额已用尽 said nothing about why
+            // or what to do). The daily check-in claims the campaigns ZCode
+            // offers as they appear; until one lands, the account has
+            // nothing to spend, and magpie reads this as the account's quota
+            // exhausted.
+            if (start && !forcedGift && !freeGift) {
+              const json = (res.headers.get("content-type") ?? "").includes("application/json")
+              if (json) {
+                const text = await res.text()
+                if (spentUp(text, res.status) && res.status < 400) {
+                  let said = ""
+                  try { said = first(JSON.parse(text)?.msg, JSON.parse(text)?.error?.message) } catch {}
+                  const error = { type: "permission_error", message: `ZCode answered ${said || "exceed quota limit"} (1005): this account holds no gift plan right now — the daily check-in claims the campaigns ZCode offers (the Weekend Build, say) as they appear, and until one lands the account has nothing to spend` }
+                  return done(kept(new Response(JSON.stringify({ type: "error", error }), { status: 429, headers: res.headers })))
                 }
                 return done(kept(res, text))
               }

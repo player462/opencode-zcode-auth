@@ -3,26 +3,29 @@
 An OpenCode / [magpie](https://usemagpie.ai) provider plugin for **ZCode**
 (Z.ai and BigModel / 智谱 GLM Coding Plan).
 
-This is **upstream `@magpie-community/opencode-zcode-auth` 0.1.51 plus three
+This is **upstream `@magpie-community/opencode-zcode-auth` 0.1.51 plus four
 things it does not have**.
 
 Upstream claims gifts now (0.1.35, #503), reads them from the app's own
 marketing feed (0.1.41–0.1.51: the 3.17 client lists plans there alone), and
 sends the version-gated headers a campaign needs (#678). What it still lacks:
 
-1. **The captcha is answered, not just reported.** Since 11-02 a guarded
-   claim is refused `400 {"code":3007,"msg":"captcha verify failed"}` for
-   every bare POST — upstream stops there, `outcome: "captcha"`, "claim it
-   in the ZCode app". This fork completes the claim: the scene comes from
+1. **The captcha is solved hands-free.** Since 11-02 a guarded claim is
+   refused `400 {"code":3007,"msg":"captcha verify failed"}` for every bare
+   POST — upstream stops there, `outcome: "captcha"`, "claim it in the
+   ZCode app". This fork finishes the claim by itself: the scene comes from
    ZCode's own client configs (`GET /api/v1/client/configs` →
    `configs.captcha`), the **traceless check** the app's renderer runs
    (`startTracelessVerification`) answers a `captchaVerifyParam` with no
-   interaction, and the claim sends it as `X-Aliyun-Captcha-Verify-Param` /
-   `-Region` exactly as the client does. Measured: the check answered in
-   ~3.4 s on the live scene `11xygtvd`. The window hooks
-   `auth.claimScene` / `auth.submitClaimAttestation` carry it; an
-   attestation that still gets a 3007 is dropped, so the next attempt asks
-   for a fresh one.
+   interaction — measured ~1.6 s–3.4 s on the live scene `11xygtvd` — and
+   the claim retries with it as `X-Aliyun-Captcha-Verify-Param` /
+   `-Region`. The solver runs the scene in a real browser (`ego-browser`,
+   already on the machine; no account data enters it — the check is
+   anonymous, scene-bound). Measured end to end on 11-07: bare POST → 3007,
+   browser param → the gate passed. `ZCODE_ATTEST=off` turns it off, and
+   the window hooks `auth.claimScene` / `auth.submitClaimAttestation` keep
+   the page-driven path; a spent param (single-use) is dropped whatever the
+   outcome, so every claim makes a fresh one.
 2. **An account with no plan can still be added.** Upstream throws "this
    account has no GLM Coding Plan … has ended or was never started" for an
    account with no coding plan, no team seat and no live Start Plan —
@@ -31,7 +34,12 @@ sends the version-gated headers a campaign needs (#678). What it still lacks:
    added, adding needs a plan. The fork signs such an account in as
    *gift-pending* (the feed's first claimable plan names it) so the
    daily check-in can claim it.
-3. **A device id the app itself uses.** `X-Device-Mid` is read from ZCode's
+3. **"Exceed quota limit" says what it means.** A gift-only account's
+   plain model request that the Start Plan answers 1005 inside a 200 went
+   through as the vendor text — magpie reads it as 余额已用尽 with no why.
+   The fork turns it into a 429 that says the account holds no gift right
+   now and the daily check-in claims the campaigns as they appear.
+4. **A device id the app itself uses.** `X-Device-Mid` is read from ZCode's
    own `telemetry-state.json` / `onboarding-record.json` instead of being
    minted per process.
 
@@ -134,9 +142,9 @@ version, so upstream's auto-update never overwrites it.
 HOME=$(mktemp -d) bun test
 ```
 
-**210 tests pass**: upstream 0.1.51's own 200, plus 10 in
-`claim-captcha.test.mjs` for the captcha attestation, the tools and the
-gift-pending sign-in.
+**213 tests pass**: upstream 0.1.51's own 200, plus 13 in
+`claim-captcha.test.mjs` / `exhausted.test.mjs` for the captcha solver, the
+tools, the gift-pending sign-in and the 1005 rewrite.
 
 ## License
 
