@@ -17,6 +17,7 @@
 // plan, device id), `accountId` the account's email.
 
 import { createDecipheriv, createHash } from "node:crypto"
+import { spawnSync } from "node:child_process"
 import { existsSync, readFileSync, readdirSync } from "node:fs"
 import { arch, homedir, release, userInfo } from "node:os"
 import { isAbsolute, join } from "node:path"
@@ -1513,9 +1514,91 @@ function secret() {
   return createHash("sha256").update(seed).digest()
 }
 
-function decrypt(key, v) {
-  if (typeof v !== "string" || !v.startsWith("enc:v1:")) return null
-  const parts = v.slice(7).split(".")
+// ---- ZCode's v2 credential envelope ------------------------------------------------
+// The 3.18 app encrypts with a random 32-byte key kept in the OS credential
+// store: on Windows a generic credential whose target is
+// "<sha256hex of the credentials.json path>.ZCode Credential Encryption"
+// (@napi-rs/keyring names a Windows entry "<user>.<service>") and whose
+// password is the key's 43-char base64url. The envelope is
+// "enc:v2:os:<key fingerprint>:<iv>.<tag>.<data>", the fingerprint being
+// sha256(key).hex.slice(0, 24) — so the envelope itself names which key
+// opens it, and the reader matches candidates against it rather than
+// recomputing the app's path hash. "enc:v2:env:<fp>:…" is the same with a
+// key made from ZCODE_CREDENTIAL_SECRET. The payload layout is v1's.
+//
+// Keys are read with a powershell CredRead (no native dependency), cached
+// per process for a while; a miss clears the cache once, so a key added
+// after this process started is found on the next read.
+
+const V2_OS = "enc:v2:os:"
+const V2_ENV = "enc:v2:env:"
+const V2_TTL = 10 * 60_000
+let v2Cache = { at: 0, keys: [] }
+
+function v2Keys() {
+  if (Date.now() - v2Cache.at < V2_TTL) return v2Cache.keys
+  if (process.platform !== "win32") return (v2Cache.keys = [])
+  return (v2Cache.keys = osKeyCandidates() ?? [])
+}
+
+// osKeyCandidates reads the app's key entries out of Windows's credential
+// store. null when powershell could not be run; [] when there are none.
+function osKeyCandidates() {
+  return _osKeyCandidatesMemo ?? (_osKeyCandidatesMemo = readOsKeys())
+}
+let _osKeyCandidatesMemo
+
+const PS_CREDREAD = `Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class ZCredRead {
+ [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+ public struct CREDENTIAL { public int Flags; public int Type; public string TargetName; public string Comment; public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten; public int CredentialBlobSize; public IntPtr CredentialBlob; public int Persist; public int AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName; }
+ [DllImport("advapi32.dll", EntryPoint="CredEnumerateW", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CredEnumerate(string f, int fl, out int n, out IntPtr p, out int r);
+ [DllImport("advapi32.dll", EntryPoint="CredReadW", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CredRead(string t, int ty, int fl, out IntPtr p);
+ [DllImport("advapi32.dll")] static extern void CredFree(IntPtr p);
+ public static string[] Read() {
+  int n, r; IntPtr p;
+  if (!CredEnumerate("*", 0, out n, out p, out r)) return new string[0];
+  var list = new System.Collections.Generic.List<string>();
+  for (int i = 0; i < n; i++) {
+   IntPtr e = Marshal.ReadIntPtr(p, i * IntPtr.Size);
+   var c = (CREDENTIAL)Marshal.PtrToStructure(e, typeof(CREDENTIAL));
+   if (c.CredentialBlobSize == 0 || !c.TargetName.Contains("ZCode Credential Encryption")) continue;
+   IntPtr q;
+   if (!CredRead(c.TargetName, 1, 0, out q)) continue;
+   var full = (CREDENTIAL)Marshal.PtrToStructure(q, typeof(CREDENTIAL));
+   list.Add(Marshal.PtrToStringUni(full.CredentialBlob, full.CredentialBlobSize / 2));
+   Marshal.FreeCoTaskMem(q);
+  }
+  return list.ToArray();
+ }
+}
+'@
+[ZCredRead]::Read() | ForEach-Object { $_ }`
+
+function readOsKeys() {
+  let out
+  try {
+    out = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", PS_CREDREAD], { timeout: 20_000, encoding: "utf8", windowsHide: true })
+  } catch {
+    return null
+  }
+  const text = `${out.stdout ?? ""}\n${out.stderr ?? ""}`
+  const keys = []
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim()
+    if (!/^[A-Za-z0-9_-]{43}$/.test(t)) continue
+    const key = Buffer.from(t, "base64url")
+    if (key.length !== 32) continue
+    keys.push({ fp: createHash("sha256").update(key).digest("hex").slice(0, 24), key })
+  }
+  return keys
+}
+
+// openV2 opens a v2 envelope's payload with a key: v1's layout, v2's key.
+function openV2(key, payload) {
+  const parts = payload.split(".")
   if (parts.length !== 3) return null
   try {
     const [iv, tag, data] = parts.map((p) => Buffer.from(p.replace(/=+$/, ""), "base64url"))
@@ -1525,6 +1608,38 @@ function decrypt(key, v) {
   } catch {
     return null
   }
+}
+
+// decrypt opens what ZCode stored: v1 (the 3.16-and-older app, key from the
+// machine seed), v2:os (the 3.18 app, key from the OS credential store), and
+// v2:env (a managed secret). extraKeys are tried beside the store's (tests,
+// or a caller that already holds the key). null when none of them opens it.
+function decrypt(key, v, extraKeys = []) {
+  if (typeof v !== "string") return null
+  if (v.startsWith("enc:v1:")) {
+    return openV2(key, v.slice(7))
+  }
+  if (v.startsWith(V2_OS) || v.startsWith(V2_ENV)) {
+    const head = v.startsWith(V2_OS) ? V2_OS : V2_ENV
+    const rest = v.slice(head.length)
+    const fp = rest.slice(0, rest.indexOf(":"))
+    const payload = rest.slice(fp.length + 1)
+    if (!fp || !payload) return null
+    const candidates = [...extraKeys, ...v2Keys()]
+    for (const { fp: known, key: k } of candidates) {
+      if (known !== fp) continue
+      return openV2(k, payload)
+    }
+    // the key may have appeared since: clear the cache and ask once more
+    _osKeyCandidatesMemo = null
+    v2Cache = { at: 0, keys: [] }
+    for (const { fp: known, key: k } of v2Keys()) {
+      if (known !== fp) continue
+      return openV2(k, payload)
+    }
+    return null
+  }
+  return null
 }
 
 function readJSON(path) {
@@ -3065,4 +3180,4 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
 // config sets what zcodeConfig has read, for tests: null is ZCode's config
 // out of reach, undefined forgets it
 const config = (cfg) => (cfgCache = cfg === undefined ? null : { cfg, at: Date.now() })
-export const _internal = { edge, EDGE_HOLD, config, entry, limitWindows, termOf, startUsage, routes, blocked, sidelined, plansOf, giftOf, dualUsage, claimHint, claimDaily, claimOne, toClaim, touchPlans, captchaConfig, putAttestation, getAttestation, zcodeAccounts, magpieHome, signedIn, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY, DEFAULT_ACCOUNTS }
+export const _internal = { edge, EDGE_HOLD, config, entry, limitWindows, termOf, startUsage, routes, blocked, sidelined, plansOf, giftOf, dualUsage, claimHint, claimDaily, claimOne, toClaim, touchPlans, captchaConfig, putAttestation, getAttestation, zcodeAccounts, magpieHome, signedIn, decrypt, openV2, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY, DEFAULT_ACCOUNTS }

@@ -3,8 +3,9 @@
 An OpenCode / [magpie](https://usemagpie.ai) provider plugin for **ZCode**
 (Z.ai and BigModel / 智谱 GLM Coding Plan).
 
-This is **upstream `@magpie-community/opencode-zcode-auth` 0.1.51 plus four
-things it does not have**.
+This is **upstream `@magpie-community/opencode-zcode-auth` 0.1.51 plus five
+things it does not have** (0.1.61, the current upstream, still has none of
+them — its `decrypt()` reads only the old `enc:v1:` envelope).
 
 Upstream claims gifts now (0.1.35, #503), reads them from the app's own
 marketing feed (0.1.41–0.1.51: the 3.17 client lists plans there alone), and
@@ -42,6 +43,17 @@ sends the version-gated headers a campaign needs (#678). What it still lacks:
 4. **A device id the app itself uses.** `X-Device-Mid` is read from ZCode's
    own `telemetry-state.json` / `onboarding-record.json` instead of being
    minted per process.
+5. **The 3.18 app's v2 credential store is read.** The 3.18 client encrypts
+   `credentials.json` with a random 32-byte key kept in the OS credential
+   store (`enc:v2:os:<key fingerprint>:<iv>.<tag>.<data>`, Windows target
+   `<…>.ZCode Credential Encryption`). Upstream's `decrypt()` returns null
+   for those, so a "ZCode app's sign-in" silently loses its session — the
+   card answers the vendor's 当前用户不存在coding plan and the check-in
+   says the account has no sign-in. The fork reads the store's keys
+   (powershell `CredRead`, no native dependency, cached 10 min), matches
+   the envelope's own fingerprint, and opens the value — measured on a
+   real 3.18.2 install: the jwt and user info decrypt, the card comes
+   back. `enc:v2:env:` (a `ZCODE_CREDENTIAL_SECRET` key) is handled too.
 
 Everything else is upstream's own code, unchanged: 0.1.46's sign-in as
 ZCode 3.17.2 and a Start Plan that starts later, 0.1.50's code-1004
@@ -142,9 +154,10 @@ version, so upstream's auto-update never overwrites it.
 HOME=$(mktemp -d) bun test
 ```
 
-**213 tests pass**: upstream 0.1.51's own 200, plus 13 in
-`claim-captcha.test.mjs` / `exhausted.test.mjs` for the captcha solver, the
-tools, the gift-pending sign-in and the 1005 rewrite.
+**218 tests pass**: upstream 0.1.51's own 200, plus 18 across
+`claim-captcha.test.mjs` / `exhausted.test.mjs` / `cred-v2.test.mjs` for the
+captcha solver, the tools, the gift-pending sign-in, the 1005 rewrite and
+the v2 credential store.
 
 ## License
 
