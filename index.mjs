@@ -815,12 +815,16 @@ async function claimOne(s, planID, attestation) {
   } catch {}
   const code = env && typeof env === "object" && env.code != null && String(env.code).trim() !== "" ? Number(env.code) : NaN
   const msg = typeof env?.msg === "string" ? env.msg : ""
-  if (code === CAPTCHA || CAPTCHA_WORDS.test(msg)) return { outcome: "captcha", why: msg || `code ${code}` }
+  // the sentence the app shows its user rides beside the code ("The claim
+  // quota for this plan has run out." on a 1005, 11-14): the why says it,
+  // not the bare vendor code
+  const said = first(typeof env?.data?.message === "string" ? env.data.message : "", msg)
+  if (code === CAPTCHA || CAPTCHA_WORDS.test(msg)) return { outcome: "captcha", why: said || msg || `code ${code}` }
   if (code === CLAIMED_ALREADY) return { outcome: "done" }
-  if (code === NOT_ELIGIBLE) return { outcome: "ineligible", why: msg || `code ${code}` }
+  if (code === NOT_ELIGIBLE) return { outcome: "ineligible", why: said || msg || `code ${code}` }
   if (code === 0 && res.ok) return { outcome: "claimed" }
   if (!Number.isFinite(code)) return { outcome: "failed", why: `HTTP ${res.status}, unreadable reply ${String(text ?? "").trim().slice(0, 120) || "(empty)"}` }
-  return { outcome: "failed", why: `${msg || "error"} (HTTP ${res.status}, code ${code})` }
+  return { outcome: "failed", why: `${said || msg || "error"} (HTTP ${res.status}, code ${code})` }
 }
 
 // TOUCH is ZCode's marketing feed: the ZCode app's claim banners come
